@@ -16,6 +16,14 @@ use zed_actions::review_panel::ToggleFocus;
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
+enum ActiveReview {
+    Empty,
+    PullRequestList,
+    ReviewThread,
+    FileList,
+    Configuration,
+}
+
 pub struct ReviewPanel {
     focus_handle: FocusHandle,
     fs: Arc<dyn Fs>,

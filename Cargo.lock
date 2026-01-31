@@ -14862,6 +14862,7 @@ dependencies = [
  "anyhow",
  "fs",
  "gpui",
+ "menu",
  "schemars",
  "serde",
  "settings",
