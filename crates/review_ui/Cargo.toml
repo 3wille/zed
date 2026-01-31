@@ -26,3 +26,4 @@ menu.workspace = true
 project.workspace = true
 git.workspace = true
 git_ui.workspace = true
+editor.workspace = true

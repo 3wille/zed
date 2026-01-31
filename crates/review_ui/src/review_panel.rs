@@ -3,18 +3,16 @@ use anyhow::Result;
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff, TreeDiffStatus};
-use git_ui::project_diff;
 use gpui::{
     App, AsyncWindowContext, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
     Render, WeakEntity, Window,
 };
-use project::git_store::branch_diff::DiffBase;
 use project::{
-    Project, ProjectPath,
+    Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::{self, Settings};
-use std::{default, process::Child, sync::Arc};
+use std::sync::Arc;
 use ui::{
     Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize, IntoElement, Label,
     LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, h_flex, prelude::*, v_flex,
@@ -262,37 +260,46 @@ impl ReviewPanel {
         let Some(workspace) = self._workspace.upgrade() else {
             return;
         };
-        let worktree_id = workspace.update(cx, |workspace, cx| {
-            workspace
-                .project()
-                .read(cx)
-                .worktrees(cx)
-                .next()
-                .map(|wt| wt.read(cx).id())
-        });
-        let Some(worktree_id) = worktree_id else {
+        let Some(active_repo) = self.active_repository.as_ref() else {
             return;
         };
-        let project_path = ProjectPath {
-            worktree_id,
-            path: path.as_ref().clone(),
+        let Some(project_path) = active_repo.read(cx).repo_path_to_project_path(&path, cx) else {
+            return;
         };
 
-        workspace.update(cx, |workspace, cx| {
-            // Find existing branch diff or create one
-            let existing = workspace
-                .items_of_type::<git_ui::project_diff::ProjectDiff>(cx)
-                .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Merge { .. }));
+        let existing = workspace
+            .read(cx)
+            .items_of_type::<git_ui::project_diff::ProjectDiff>(cx)
+            .find(|item| {
+                matches!(
+                    item.read(cx).diff_base(cx),
+                    project::git_store::branch_diff::DiffBase::Merge { .. }
+                )
+            });
 
-            if let Some(existing) = existing {
+        if let Some(existing) = existing {
+            workspace.update(cx, |workspace, cx| {
                 workspace.activate_item(&existing, true, true, window, cx);
-                existing.update(cx, |diff, cx| {
-                    diff.move_to_project_path(&project_path, window, cx);
-                });
-            } else {
-                window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
-            }
-        });
+            });
+            existing.update(cx, |diff, cx| {
+                diff.move_to_project_path(&project_path, window, cx);
+            });
+        } else {
+            window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
+            let weak_self = cx.weak_entity();
+            cx.spawn_in(window, async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                weak_self
+                    .update_in(cx, |this, window, cx| {
+                        this.open_file_diff(path, window, cx);
+                    })
+                    .ok();
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
     }
 
     fn render_file_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
