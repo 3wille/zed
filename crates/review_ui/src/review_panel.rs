@@ -1,7 +1,7 @@
 use crate::review_panel_settings::ReviewPanelSettings;
 use anyhow::Result;
 use fs::Fs;
-use git::status::{DiffTreeType, TreeDiff};
+use git::status::{DiffTreeType, TreeDiff, TreeDiffStatus};
 use gpui::{
     App, AsyncWindowContext, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
     Render, WeakEntity, Window,
@@ -11,7 +11,7 @@ use project::{
     git_store::{GitStoreEvent, Repository},
 };
 use settings::{self, Settings};
-use std::{default, sync::Arc};
+use std::{default, process::Child, sync::Arc};
 use ui::{
     Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize, IntoElement, Label,
     LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, h_flex, prelude::*, v_flex,
@@ -251,6 +251,95 @@ impl ReviewPanel {
         })
         .detach_and_log_err(cx);
     }
+
+    fn render_file_list(&self, cx: &mut Context<'_, ReviewPanel>) -> AnyElement {
+        let Some(tree_diff) = &self.tree_diff else {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .child(Label::new("Loading...").color(Color::Muted))
+                .into_any_element();
+        };
+
+        let mut entries: Vec<_> = tree_diff.entries.iter().collect();
+        entries.sort_by(|(path_a, status_a), (path_b, status_b)| {
+            let order = |s: &TreeDiffStatus| match s {
+                TreeDiffStatus::Added => 0,
+                TreeDiffStatus::Modified { .. } => 1,
+                TreeDiffStatus::Deleted { .. } => 2,
+            };
+            order(status_a)
+                .cmp(&order(status_b))
+                .then(path_a.cmp(path_b))
+        });
+
+        let header_text = format!(
+            "{} <- {}",
+            self.base_branch.as_ref().map(|s| s.as_ref()).unwrap_or("?"),
+            self.head_branch.as_ref().map(|s| s.as_ref()).unwrap_or("?"),
+        );
+
+        let file_count = entries.len();
+        let added = entries
+            .iter()
+            .filter(|(_, s)| matches!(s, TreeDiffStatus::Added))
+            .count();
+        let modified = entries
+            .iter()
+            .filter(|(_, s)| matches!(s, TreeDiffStatus::Modified { .. }))
+            .count();
+        let deleted = entries
+            .iter()
+            .filter(|(_, s)| matches!(s, TreeDiffStatus::Deleted { .. }))
+            .count();
+
+        let summary = format!(
+            "{} changed files (+{} -{} ~{})",
+            file_count, added, deleted, modified
+        );
+        v_flex()
+            .id("review-file-list")
+            .size_full()
+            .overflow_scroll()
+            .child(
+                h_flex().px_2().py_1().child(
+                    Label::new(header_text)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(
+                h_flex().px_2().pb_1().child(
+                    Label::new(summary)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .children(entries.into_iter().map(|(path, status)| {
+                let (icon, color) = match status {
+                    TreeDiffStatus::Added => (IconName::Plus, Color::Created),
+                    TreeDiffStatus::Modified { .. } => (IconName::Pencil, Color::Modified),
+                    TreeDiffStatus::Deleted { .. } => (IconName::Dash, Color::Deleted),
+                };
+
+                h_flex()
+                    .id(SharedString::from(
+                        path.as_std_path().to_string_lossy().to_string(),
+                    ))
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .rounded_md()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .child(Icon::new(icon).size(IconSize::Small).color(color))
+                    .child(
+                        Label::new(path.as_std_path().to_string_lossy().to_string())
+                            .size(LabelSize::Small),
+                    )
+            }))
+            .into_any_element()
+    }
 }
 
 impl Render for ReviewPanel {
@@ -282,13 +371,7 @@ impl Render for ReviewPanel {
                         .items_center()
                         .child(Label::new("Review Thread (coming soon)").color(Color::Muted)),
                 ),
-                ActiveView::FileList => parent.child(
-                    v_flex()
-                        .size_full()
-                        .justify_center()
-                        .items_center()
-                        .child(Label::new("Changed Files (coming soon)").color(Color::Muted)),
-                ),
+                ActiveView::FileList => parent.child(self.render_file_list(cx)),
                 ActiveView::Configuration => parent.child(
                     v_flex()
                         .size_full()
