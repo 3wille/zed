@@ -16,7 +16,7 @@ use zed_actions::review_panel::ToggleFocus;
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
-enum ActiveReview {
+enum ActiveView {
     Empty,
     PullRequestList,
     ReviewThread,
@@ -25,9 +25,12 @@ enum ActiveReview {
 }
 
 pub struct ReviewPanel {
+    workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     fs: Arc<dyn Fs>,
     width: Option<Pixels>,
+    active_view: ActiveView,
+    previous_view: Option<ActiveView>,
 }
 
 pub fn register(workspace: &mut Workspace) {
