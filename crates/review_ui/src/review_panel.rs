@@ -1,5 +1,6 @@
 use crate::review_panel_settings::ReviewPanelSettings;
 use anyhow::Result;
+use collections::HashSet;
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff, TreeDiffStatus};
@@ -40,6 +41,8 @@ pub struct ReviewPanel {
     base_branch: Option<SharedString>,
     head_branch: Option<SharedString>,
     tree_diff: Option<TreeDiff>,
+    viewed_files: HashSet<RepoPath>,
+    selected_entry: Option<usize>,
     focus_handle: FocusHandle,
     recent_reviews_menu_handle: PopoverMenuHandle<ContextMenu>,
     options_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -89,6 +92,8 @@ impl ReviewPanel {
             base_branch: None,
             head_branch: None,
             tree_diff: None,
+            viewed_files: HashSet::default(),
+            selected_entry: None,
             focus_handle: cx.focus_handle(),
             fs,
             width: None,
@@ -249,6 +254,8 @@ impl ReviewPanel {
             let tree_diff = diff_rx.await??;
             this.update(cx, |this, cx| {
                 this.tree_diff = Some(tree_diff);
+                this.viewed_files.clear();
+                this.selected_entry = None;
                 this.set_active_view(ActiveView::FileList, cx);
             })?;
             anyhow::Ok(())
@@ -257,6 +264,11 @@ impl ReviewPanel {
     }
 
     fn open_file_diff(&mut self, path: RepoPath, window: &mut Window, cx: &mut Context<Self>) {
+        self.viewed_files.insert(path.clone());
+        let entries = self.sorted_entries();
+        self.selected_entry = entries.iter().position(|(p, _)| *p == path);
+        cx.notify();
+
         let Some(workspace) = self._workspace.upgrade() else {
             return;
         };
