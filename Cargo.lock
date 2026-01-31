@@ -14861,8 +14861,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fs",
+ "git",
  "gpui",
  "menu",
+ "project",
  "schemars",
  "serde",
  "settings",
