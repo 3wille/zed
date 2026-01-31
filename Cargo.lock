@@ -13980,6 +13980,7 @@ dependencies = [
  "anyhow",
  "fs",
  "git",
+ "git_ui",
  "gpui",
  "menu",
  "project",

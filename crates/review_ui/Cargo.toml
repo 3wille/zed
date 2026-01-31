@@ -25,3 +25,4 @@ zed_actions.workspace = true
 menu.workspace = true
 project.workspace = true
 git.workspace = true
+git_ui.workspace = true
