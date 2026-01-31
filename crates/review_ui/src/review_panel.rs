@@ -8,7 +8,7 @@ use gpui::{
 };
 use project::{
     Project,
-    git_store::{GitStoreEvent, Repository},
+    git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::{self, Settings};
 use std::{default, process::Child, sync::Arc};
@@ -72,6 +72,9 @@ impl ReviewPanel {
                     this.active_repository = this.project.read(cx).active_repository(cx);
                     this.load_branches(cx);
                     cx.notify();
+                }
+                GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::BranchChanged, _) => {
+                    this.load_branches(cx);
                 }
                 _ => {}
             },
