@@ -1,13 +1,17 @@
 use crate::review_panel_settings::ReviewPanelSettings;
 use anyhow::Result;
 use fs::Fs;
+use git::status::{DiffTreeType, TreeDiff};
 use gpui::{
     App, AsyncWindowContext, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
     Render, WeakEntity, Window,
 };
-use project::{Project, git_store::Repository};
+use project::{
+    Project,
+    git_store::{GitStoreEvent, Repository},
+};
 use settings::{self, Settings};
-use std::sync::Arc;
+use std::{default, sync::Arc};
 use ui::{
     Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize, IntoElement, Label,
     LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, h_flex, prelude::*, v_flex,
@@ -17,7 +21,6 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 use zed_actions::review_panel::ToggleFocus;
-use git::status::{TreeDiff, DiffTreeType}
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
@@ -60,29 +63,35 @@ impl ReviewPanel {
         let project = workspace.project().clone();
         let active_repository = project.read(cx).active_repository(cx);
         let git_store = project.read(cx).git_store().clone();
-        cx.subscribe_in(&git_store, window, |this, _store, event, _window, cx| {
-          match event {
-            GitStoreEvent::ActiveRepositoryChanged(_) => {
-              this.active_repository = this.project.read(cx).active_repository(cx);
-              cx.notify();
-            }
-            _ => {}
-          }
-        }).detach();
+        cx.subscribe_in(
+            &git_store,
+            window,
+            |this, _store, event, _window, cx| match event {
+                GitStoreEvent::ActiveRepositoryChanged(_) => {
+                    this.active_repository = this.project.read(cx).active_repository(cx);
+                    this.load_branches(cx);
+                    cx.notify();
+                }
+                _ => {}
+            },
+        )
+        .detach();
 
-        Self {
-          _workspace: weak_workspace,
-          project,
-          active_repository,
-          base_branch: None,
-          head_branch: None,
-          focus_handle: cx.focus_handle(),
-          fs,
-          width: None,
-          recent_reviews_menu_handle: PopoverMenuHandle::default(),
-          options_menu_handle: PopoverMenuHandle::default(),
-          active_view: ActiveView::Empty,
-        }
+        let mut this = Self {
+            _workspace: weak_workspace,
+            project,
+            active_repository,
+            base_branch: None,
+            head_branch: None,
+            focus_handle: cx.focus_handle(),
+            fs,
+            width: None,
+            recent_reviews_menu_handle: PopoverMenuHandle::default(),
+            options_menu_handle: PopoverMenuHandle::default(),
+            active_view: ActiveView::Empty,
+        };
+        this.load_branches(cx);
+        this
     }
 
     pub async fn load(
@@ -176,6 +185,40 @@ impl ReviewPanel {
                     .child(self.render_recent_reviews_menu(cx))
                     .child(self.render_options_menu(window, cx)),
             )
+    }
+
+    fn load_branches(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+
+        let default_branch_rx = repo.update(cx, |repo, _cx| repo.default_branch(false));
+        let branches_rx = repo.update(cx, |repo, _cx| repo.branches());
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(Some(default)) = default_branch_rx.await? {
+                this.update(cx, |this, cx| {
+                    this.base_branch = Some(default);
+                    cx.notify();
+                })?;
+            }
+
+            if let Ok(branches) = branches_rx.await? {
+                let head = branches
+                    .iter()
+                    .find(|b| b.is_head)
+                    .map(|b| b.ref_name.clone());
+                if let Some(head) = head {
+                    this.update(cx, |this, cx| {
+                        this.head_branch = Some(head);
+                        cx.notify();
+                    })?;
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 }
 
