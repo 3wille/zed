@@ -5,6 +5,7 @@ use gpui::{
     App, AsyncWindowContext, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
     Render, WeakEntity, Window,
 };
+use project::{Project, git_store::Repository};
 use settings::{self, Settings};
 use std::sync::Arc;
 use ui::{
@@ -16,6 +17,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 use zed_actions::review_panel::ToggleFocus;
+use git::status::{TreeDiff, DiffTreeType}
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
@@ -29,6 +31,10 @@ enum ActiveView {
 
 pub struct ReviewPanel {
     _workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
+    active_repository: Option<Entity<Repository>>,
+    base_branch: Option<SharedString>,
+    head_branch: Option<SharedString>,
     focus_handle: FocusHandle,
     recent_reviews_menu_handle: PopoverMenuHandle<ContextMenu>,
     options_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -47,18 +53,35 @@ impl ReviewPanel {
     pub fn new(
         workspace: &Workspace,
         weak_workspace: WeakEntity<Workspace>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let fs = workspace.app_state().fs.clone();
+        let project = workspace.project().clone();
+        let active_repository = project.read(cx).active_repository(cx);
+        let git_store = project.read(cx).git_store().clone();
+        cx.subscribe_in(&git_store, window, |this, _store, event, _window, cx| {
+          match event {
+            GitStoreEvent::ActiveRepositoryChanged(_) => {
+              this.active_repository = this.project.read(cx).active_repository(cx);
+              cx.notify();
+            }
+            _ => {}
+          }
+        }).detach();
+
         Self {
-            _workspace: weak_workspace,
-            focus_handle: cx.focus_handle(),
-            fs,
-            width: None,
-            recent_reviews_menu_handle: PopoverMenuHandle::default(),
-            options_menu_handle: PopoverMenuHandle::default(),
-            active_view: ActiveView::Empty,
+          _workspace: weak_workspace,
+          project,
+          active_repository,
+          base_branch: None,
+          head_branch: None,
+          focus_handle: cx.focus_handle(),
+          fs,
+          width: None,
+          recent_reviews_menu_handle: PopoverMenuHandle::default(),
+          options_menu_handle: PopoverMenuHandle::default(),
+          active_view: ActiveView::Empty,
         }
     }
 
