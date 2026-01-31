@@ -1,4 +1,5 @@
 mod review_panel;
+mod review_panel_settings;
 
 pub use review_panel::ReviewPanel;
 
