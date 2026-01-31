@@ -1,13 +1,16 @@
 use crate::review_panel_settings::ReviewPanelSettings;
 use anyhow::Result;
 use fs::Fs;
+use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff, TreeDiffStatus};
+use git_ui::project_diff;
 use gpui::{
     App, AsyncWindowContext, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
     Render, WeakEntity, Window,
 };
+use project::git_store::branch_diff::DiffBase;
 use project::{
-    Project,
+    Project, ProjectPath,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::{self, Settings};
@@ -255,7 +258,44 @@ impl ReviewPanel {
         .detach_and_log_err(cx);
     }
 
-    fn render_file_list(&self, cx: &mut Context<'_, ReviewPanel>) -> AnyElement {
+    fn open_file_diff(&mut self, path: RepoPath, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self._workspace.upgrade() else {
+            return;
+        };
+        let worktree_id = workspace.update(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .map(|wt| wt.read(cx).id())
+        });
+        let Some(worktree_id) = worktree_id else {
+            return;
+        };
+        let project_path = ProjectPath {
+            worktree_id,
+            path: path.as_ref().clone(),
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            // Find existing branch diff or create one
+            let existing = workspace
+                .items_of_type::<git_ui::project_diff::ProjectDiff>(cx)
+                .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Merge { .. }));
+
+            if let Some(existing) = existing {
+                workspace.activate_item(&existing, true, true, window, cx);
+                existing.update(cx, |diff, cx| {
+                    diff.move_to_project_path(&project_path, window, cx);
+                });
+            } else {
+                window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
+            }
+        });
+    }
+
+    fn render_file_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(tree_diff) = &self.tree_diff else {
             return v_flex()
                 .size_full()
@@ -340,6 +380,12 @@ impl ReviewPanel {
                         Label::new(path.as_std_path().to_string_lossy().to_string())
                             .size(LabelSize::Small),
                     )
+                    .on_click({
+                        let path = path.clone();
+                        cx.listener(move |this, _event, window, cx| {
+                            this.open_file_diff(path.clone(), window, cx);
+                        })
+                    })
             }))
             .into_any_element()
     }
