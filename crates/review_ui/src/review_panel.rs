@@ -38,6 +38,7 @@ pub struct ReviewPanel {
     active_repository: Option<Entity<Repository>>,
     base_branch: Option<SharedString>,
     head_branch: Option<SharedString>,
+    tree_diff: Option<TreeDiff>,
     focus_handle: FocusHandle,
     recent_reviews_menu_handle: PopoverMenuHandle<ContextMenu>,
     options_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -83,6 +84,7 @@ impl ReviewPanel {
             active_repository,
             base_branch: None,
             head_branch: None,
+            tree_diff: None,
             focus_handle: cx.focus_handle(),
             fs,
             width: None,
@@ -211,11 +213,40 @@ impl ReviewPanel {
                 if let Some(head) = head {
                     this.update(cx, |this, cx| {
                         this.head_branch = Some(head);
+                        this.load_diff(cx);
                         cx.notify();
                     })?;
                 }
             }
 
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn load_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+
+        let Some(base) = self.base_branch.clone() else {
+            return;
+        };
+
+        let Some(head) = self.head_branch.clone() else {
+            return;
+        };
+
+        let diff_rx = repo.update(cx, |repo, cx| {
+            repo.diff_tree(DiffTreeType::MergeBase { base, head }, cx)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let tree_diff = diff_rx.await??;
+            this.update(cx, |this, cx| {
+                this.tree_diff = Some(tree_diff);
+                this.set_active_view(ActiveView::FileList, cx);
+            })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
