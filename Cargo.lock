@@ -13974,6 +13974,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "review_ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "serde",
+ "ui",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -21086,6 +21098,7 @@ dependencies = [
  "remote",
  "repl",
  "reqwest_client",
+ "review_ui",
  "rope",
  "search",
  "semver",
