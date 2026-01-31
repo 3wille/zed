@@ -14860,8 +14860,11 @@ name = "review_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fs",
  "gpui",
+ "schemars",
  "serde",
+ "settings",
  "ui",
  "workspace",
  "zed_actions",
