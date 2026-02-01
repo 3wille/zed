@@ -1,7 +1,7 @@
 use crate::github_provider::GitHubProvider;
 use crate::github_token::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
-use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewProvider};
+use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewComment, ReviewProvider};
 use anyhow::Result;
 use collections::HashSet;
 use credentials_provider::CredentialsProvider;
@@ -72,6 +72,9 @@ pub struct ReviewPanel {
     remote_owner: Option<String>,
     remote_repo: Option<String>,
     pr_search_editor: Entity<Editor>,
+    selected_pr: Option<PullRequestInfo>,
+    pr_comments: Vec<ReviewComment>,
+    pr_comments_loading: bool,
 }
 
 pub fn register(workspace: &mut Workspace) {
@@ -156,6 +159,9 @@ impl ReviewPanel {
             remote_owner: None,
             remote_repo: None,
             pr_search_editor,
+            selected_pr: None,
+            pr_comments: Vec::new(),
+            pr_comments_loading: false,
         };
         this.initialize_provider(cx);
         this.load_branches(cx);
@@ -384,9 +390,39 @@ impl ReviewPanel {
     }
 
     fn select_pull_request(&mut self, pr: &PullRequestInfo, cx: &mut Context<Self>) {
+        self.selected_pr = Some(pr.clone());
         self.base_branch = Some(pr.base_ref.clone());
         self.head_branch = Some(pr.head_ref.clone());
+
+        self.load_pr_comments(pr.number, cx);
         self.load_diff(cx);
+        self.set_active_view(ActiveView::ReviewThread, cx);
+    }
+
+    fn load_pr_comments(&mut self, pr_number: u32, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        let Some(owner) = self.remote_owner.clone() else {
+            return;
+        };
+        let Some(repo) = self.remote_repo.clone() else {
+            return;
+        };
+
+        self.pr_comments_loading = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let comments = provider.fetch_reviews(&owner, &repo, pr_number).await?;
+            this.update(cx, |this, cx| {
+                this.pr_comments = comments;
+                this.pr_comments_loading = false;
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn load_branches(&mut self, cx: &mut Context<Self>) {
@@ -599,6 +635,127 @@ impl ReviewPanel {
             let path = path.clone();
             self.open_file_diff(path, window, cx);
         }
+    }
+    fn render_review_thread(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pr) = &self.selected_pr else {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .child(Label::new("No PR selected").color(Color::Muted))
+                .into_any_element();
+        };
+
+        let pr_number = pr.number;
+        let pr_title = pr.title.clone();
+        let pr_author = pr.author.clone();
+        let pr_description = pr.description.clone();
+        let comments = self.pr_comments.clone();
+        let loading = self.pr_comments_loading;
+
+        v_flex()
+            .id("review-thread")
+            .size_full()
+            .overflow_scroll()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        IconButton::new("back-to-pr-list", IconName::ArrowLeft)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Back to PR list"))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.selected_pr = None;
+                                this.pr_comments.clear();
+                                this.set_active_view(ActiveView::PullRequestList, cx);
+                            })),
+                    )
+                    .child(
+                        Label::new(format!("#{}", pr_number))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .child(Label::new(pr_title.to_string()).size(LabelSize::Small))
+                    .child(
+                        Label::new(format!("by {}", pr_author))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .when(!pr_description.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .mt_1()
+                                .p_2()
+                                .rounded_md()
+                                .bg(cx.theme().colors().editor_background)
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .child(
+                                    Label::new(pr_description.to_string())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                h_flex().px_2().py_1().child(
+                    Label::new(if loading {
+                        "Loading comments...".to_string()
+                    } else {
+                        format!("{} comments", comments.len())
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                ),
+            )
+            .children(
+                comments
+                    .into_iter()
+                    .map(|comment| self.render_comment_card(&comment, cx)),
+            )
+            .child(
+                // "View files" button at the bottom
+                h_flex().px_2().py_2().child(
+                    div()
+                        .id("view-files-button")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(cx.theme().colors().ghost_element_background)
+                        .hover(|s| s.bg(cx.theme().colors().ghost_element_hover))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::FileTree)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new("View changed files").size(LabelSize::Small)),
+                        )
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.set_active_view(ActiveView::FileList, cx);
+                        })),
+                ),
+            )
+            .into_any_element()
+    }
+
+    // TODO(flaticols): implement render_comment_card
+    fn render_comment_card(&self, _comment: &ReviewComment, _cx: &mut Context<Self>) -> AnyElement {
+        div().into_any_element()
     }
 
     fn render_file_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -848,19 +1005,23 @@ impl ReviewPanel {
                                                         .ok();
                                                 }
                                             })
-                                            .entry("All", None, {
-                                                let weak_panel = weak_panel.clone();
-                                                move |_window, cx| {
-                                                    weak_panel
-                                                        .update(cx, |this, cx| {
-                                                            this.set_pr_filter(
-                                                                PullRequestState::All,
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                }
-                                            })
+                                            .entry(
+                                                "All",
+                                                None,
+                                                {
+                                                    let weak_panel = weak_panel.clone();
+                                                    move |_window, cx| {
+                                                        weak_panel
+                                                            .update(cx, |this, cx| {
+                                                                this.set_pr_filter(
+                                                                    PullRequestState::All,
+                                                                    cx,
+                                                                );
+                                                            })
+                                                            .ok();
+                                                    }
+                                                },
+                                            )
                                         },
                                     ))
                                 }
@@ -934,13 +1095,7 @@ impl Render for ReviewPanel {
                         .child(Label::new("No review selected").color(Color::Muted)),
                 ),
                 ActiveView::PullRequestList => parent.child(self.render_pull_request_list(cx)),
-                ActiveView::ReviewThread => parent.child(
-                    v_flex()
-                        .size_full()
-                        .justify_center()
-                        .items_center()
-                        .child(Label::new("Review Thread (coming soon)").color(Color::Muted)),
-                ),
+                ActiveView::ReviewThread => parent.child(self.render_review_thread(cx)),
                 ActiveView::FileList => parent.child(self.render_file_list(cx)),
                 ActiveView::Configuration => parent.child(
                     v_flex()
