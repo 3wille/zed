@@ -1,5 +1,6 @@
 mod review_panel;
 mod review_panel_settings;
+mod review_provider;
 
 pub use review_panel::ReviewPanel;
 

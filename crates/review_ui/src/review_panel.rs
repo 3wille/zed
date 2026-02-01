@@ -26,6 +26,13 @@ use zed_actions::review_panel::ToggleFocus;
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
+#[derive(Clone)]
+struct RecentReview {
+    base_branch: SharedString,
+    head_branch: SharedString,
+    file_count: usize,
+}
+
 enum ActiveView {
     Empty,
     PullRequestList,
@@ -49,6 +56,7 @@ pub struct ReviewPanel {
     fs: Arc<dyn Fs>,
     width: Option<Pixels>,
     active_view: ActiveView,
+    recent_reviews: Vec<RecentReview>,
 }
 
 pub fn register(workspace: &mut Workspace) {
@@ -100,6 +108,7 @@ impl ReviewPanel {
             recent_reviews_menu_handle: PopoverMenuHandle::default(),
             options_menu_handle: PopoverMenuHandle::default(),
             active_view: ActiveView::Empty,
+            recent_reviews: Vec::new(),
         };
         this.load_branches(cx);
         this
@@ -120,7 +129,10 @@ impl ReviewPanel {
         cx.notify();
     }
 
-    fn render_recent_reviews_menu(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_recent_reviews_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let recent = self.recent_reviews.clone();
+        let weak_panel = cx.weak_entity();
+
         PopoverMenu::new("review-nav-menu")
             .trigger_with_tooltip(
                 IconButton::new("review-nav-menu", IconName::MenuAltTemp)
@@ -130,9 +142,38 @@ impl ReviewPanel {
             .anchor(Corner::TopRight)
             .with_handle(self.recent_reviews_menu_handle.clone())
             .menu(move |window, cx| {
-                Some(ContextMenu::build(window, cx, |menu, _window, _| {
-                    menu.entry("No recent reviews", None, |_window, _cx| {})
-                }))
+                let recent = recent.clone();
+                let weak_panel = weak_panel.clone();
+                Some(ContextMenu::build(
+                    window,
+                    cx,
+                    move |mut menu, _window, _cx| {
+                        if recent.is_empty() {
+                            return menu.entry("No recent reviews", None, |_window, _cx| {});
+                        }
+
+                        menu = menu.header("Recent");
+                        for entry in &recent {
+                            let label = format!(
+                                "{}..{} ({} files)",
+                                entry.base_branch, entry.head_branch, entry.file_count
+                            );
+                            let base = entry.base_branch.clone();
+                            let head = entry.head_branch.clone();
+                            let weak_panel = weak_panel.clone();
+                            menu = menu.entry(label, None, move |_window, cx| {
+                                weak_panel
+                                    .update(cx, |this, cx| {
+                                        this.base_branch = Some(base.clone());
+                                        this.head_branch = Some(head.clone());
+                                        this.load_diff(cx);
+                                    })
+                                    .ok();
+                            });
+                        }
+                        menu
+                    },
+                ))
             })
     }
 
@@ -254,6 +295,29 @@ impl ReviewPanel {
             let tree_diff = diff_rx.await??;
             this.update(cx, |this, cx| {
                 this.tree_diff = Some(tree_diff);
+
+                //save to recent reviews
+                let file_count = this
+                    .tree_diff
+                    .as_ref()
+                    .map(|d| d.entries.len())
+                    .unwrap_or(0);
+
+                if let (Some(base), Some(head)) =
+                    (this.base_branch.clone(), this.head_branch.clone())
+                {
+                    this.recent_reviews
+                        .retain(|r| !(r.base_branch == base && r.head_branch == head));
+                    this.recent_reviews.insert(
+                        0,
+                        RecentReview {
+                            base_branch: base,
+                            head_branch: head,
+                            file_count,
+                        },
+                    );
+                }
+
                 this.viewed_files.clear();
                 this.selected_entry = None;
                 this.set_active_view(ActiveView::FileList, cx);
@@ -458,7 +522,11 @@ impl ReviewPanel {
 
                 let is_selected = self.selected_entry == Some(ix);
                 let is_viewed = self.viewed_files.contains(&path);
-                let label_color = if is_viewed { Color::Muted } else { Color::Default };
+                let label_color = if is_viewed {
+                    Color::Muted
+                } else {
+                    Color::Default
+                };
 
                 let bg = if is_selected {
                     info_color.alpha(selected_bg_alpha)
@@ -483,18 +551,24 @@ impl ReviewPanel {
                     .when(!is_viewed, |row| {
                         row.child(
                             div()
+                                .flex_none()
                                 .w(px(6.))
                                 .h(px(6.))
                                 .rounded_full()
                                 .bg(cx.theme().status().info),
                         )
                     })
-                    .when(is_viewed, |row| row.child(div().w(px(6.)).h(px(6.))))
+                    .when(is_viewed, |row| {
+                        row.child(div().flex_none().w(px(6.)).h(px(6.)))
+                    })
                     .child(Icon::new(icon).size(IconSize::Small).color(color))
                     .child(
-                        Label::new(path.as_std_path().to_string_lossy().to_string())
-                            .size(LabelSize::Small)
-                            .color(label_color),
+                        div().overflow_x_hidden().child(
+                            Label::new(path.as_std_path().to_string_lossy().to_string())
+                                .size(LabelSize::Small)
+                                .color(label_color)
+                                .single_line(),
+                        ),
                     )
                     .on_click({
                         let path = path.clone();
