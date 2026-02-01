@@ -14861,6 +14861,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "credentials_provider",
  "editor",
  "fs",
  "git",
@@ -14871,6 +14872,7 @@ dependencies = [
  "schemars",
  "serde",
  "settings",
+ "smol",
  "ui",
  "workspace",
  "zed_actions",
