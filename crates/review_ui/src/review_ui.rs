@@ -1,3 +1,4 @@
+mod github_provider;
 mod github_token;
 mod review_panel;
 mod review_panel_settings;

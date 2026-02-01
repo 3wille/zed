@@ -30,3 +30,6 @@ editor.workspace = true
 collections.workspace = true
 credentials_provider.workspace = true
 smol.workspace = true
+http_client.workspace = true
+serde_json.workspace = true
+futures.workspace = true
