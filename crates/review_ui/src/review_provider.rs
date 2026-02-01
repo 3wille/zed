@@ -147,11 +147,13 @@ pub trait ReviewProvider: Send + Sync {
 
     fn merge_pull_request(
         &self,
-        owner: &str,
-        repo: &str,
-        number: u32,
-        merge_method: MergeMethod,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+        _owner: &str,
+        _repo: &str,
+        _number: u32,
+        _merge_method: MergeMethod,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        Box::pin(async { Err(anyhow::anyhow!("merge not supported by this provider")) })
+    }
 
     fn mark_file_viewed(
         &self,
