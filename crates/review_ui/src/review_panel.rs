@@ -1,13 +1,19 @@
+use crate::github_provider::GitHubProvider;
+use crate::github_token::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
+use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewProvider};
 use anyhow::Result;
 use collections::HashSet;
+use credentials_provider::CredentialsProvider;
+use editor::{Editor, EditorEvent};
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff, TreeDiffStatus};
 use gpui::{
     App, AsyncWindowContext, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
-    Render, WeakEntity, Window,
+    Render, SharedString, WeakEntity, Window,
 };
+use http_client::HttpClient;
 use project::{
     Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
@@ -15,7 +21,7 @@ use project::{
 use settings::{self, Settings};
 use std::sync::Arc;
 use ui::{
-    Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize, IntoElement, Label,
+    Color, ContextMenu, DynamicSpacing, Icon, IconButton, IconName, IconSize, IntoElement, Label,
     LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, h_flex, prelude::*, v_flex,
 };
 use workspace::{
@@ -57,6 +63,15 @@ pub struct ReviewPanel {
     width: Option<Pixels>,
     active_view: ActiveView,
     recent_reviews: Vec<RecentReview>,
+    http_client: Arc<dyn HttpClient>,
+    pull_requests: Vec<PullRequestInfo>,
+    pr_list_loading: bool,
+    pr_filter: PullRequestState,
+    pr_filter_menu_handle: PopoverMenuHandle<ContextMenu>,
+    provider: Option<Arc<dyn ReviewProvider>>,
+    remote_owner: Option<String>,
+    remote_repo: Option<String>,
+    pr_search_editor: Entity<Editor>,
 }
 
 pub fn register(workspace: &mut Workspace) {
@@ -82,13 +97,36 @@ impl ReviewPanel {
             |this, _store, event, _window, cx| match event {
                 GitStoreEvent::ActiveRepositoryChanged(_) => {
                     this.active_repository = this.project.read(cx).active_repository(cx);
+                    this.initialize_provider(cx);
                     this.load_branches(cx);
                     cx.notify();
                 }
                 GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::BranchChanged, _) => {
                     this.load_branches(cx);
                 }
+                GitStoreEvent::RepositoryUpdated(..) => {
+                    if this.provider.is_none() {
+                        this.initialize_provider(cx);
+                    }
+                }
                 _ => {}
+            },
+        )
+        .detach();
+
+        let pr_search_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Filter by # or author...", window, cx);
+            editor
+        });
+
+        cx.subscribe_in(
+            &pr_search_editor,
+            window,
+            |this, _editor, event: &EditorEvent, _window, cx| {
+                if matches!(event, EditorEvent::BufferEdited { .. }) {
+                    cx.notify();
+                }
             },
         )
         .detach();
@@ -109,7 +147,17 @@ impl ReviewPanel {
             options_menu_handle: PopoverMenuHandle::default(),
             active_view: ActiveView::Empty,
             recent_reviews: Vec::new(),
+            http_client: workspace.client().http_client().clone(),
+            pull_requests: Vec::new(),
+            pr_list_loading: false,
+            pr_filter: PullRequestState::Open,
+            pr_filter_menu_handle: PopoverMenuHandle::default(),
+            provider: None,
+            remote_owner: None,
+            remote_repo: None,
+            pr_search_editor,
         };
+        this.initialize_provider(cx);
         this.load_branches(cx);
         this
     }
@@ -126,7 +174,22 @@ impl ReviewPanel {
 
     fn set_active_view(&mut self, new_view: ActiveView, cx: &mut Context<Self>) {
         self.active_view = new_view;
+        if matches!(self.active_view, ActiveView::PullRequestList) && self.pull_requests.is_empty()
+        {
+            self.load_pull_requests(cx);
+        }
         cx.notify();
+    }
+
+    fn refresh_pull_requests(&mut self, cx: &mut Context<Self>) {
+        self.load_pull_requests(cx);
+    }
+
+    fn set_pr_filter(&mut self, state: PullRequestState, cx: &mut Context<Self>) {
+        if self.pr_filter != state {
+            self.pr_filter = state;
+            self.load_pull_requests(cx);
+        }
     }
 
     fn render_recent_reviews_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -180,8 +243,9 @@ impl ReviewPanel {
     fn render_options_menu(
         &self,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let weak_panel = cx.weak_entity();
         PopoverMenu::new("review-options-menu")
             .trigger_with_tooltip(
                 IconButton::new("review-options-menu", IconName::EllipsisVertical)
@@ -191,13 +255,25 @@ impl ReviewPanel {
             .anchor(Corner::TopRight)
             .with_handle(self.options_menu_handle.clone())
             .menu(move |window, cx| {
-                Some(ContextMenu::build(window, cx, |menu, _window, _| {
+                let weak_panel = weak_panel.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _window, _| {
                     menu.entry("Configuration", None, |_window, _cx| {
                         // TODO: dispatch OpenConfiguration action
                     })
                     .separator()
                     .entry("Full Screen", None, |_window, _cx| {
                         // TODO: dispatch ToggleZoom action
+                    })
+                    .separator()
+                    .entry("Refresh", None, {
+                        let weak_panel = weak_panel.clone();
+                        move |_window, cx| {
+                            weak_panel
+                                .update(cx, |this, cx| {
+                                    this.refresh_pull_requests(cx);
+                                })
+                                .ok();
+                        }
                     })
                 }))
             })
@@ -237,6 +313,80 @@ impl ReviewPanel {
                     .child(self.render_recent_reviews_menu(cx))
                     .child(self.render_options_menu(window, cx)),
             )
+    }
+
+    fn initialize_provider(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            log::info!("review_panel: no active repository");
+            return;
+        };
+
+        let remote_url = repo.read(cx).default_remote_url();
+        log::info!("review_panel: remote_url = {:?}", remote_url);
+        let Some(remote_url) = remote_url else {
+            log::info!("review_panel: no remote URL found");
+            return;
+        };
+
+        let Ok((owner, repo_name)) = parse_github_remote(&remote_url) else {
+            log::info!("review_panel: failed to parse remote URL: {}", remote_url);
+            return;
+        };
+        log::info!("review_panel: parsed {}/{}", owner, repo_name);
+
+        let http_client = self.http_client.clone();
+        let credentials_provider = <dyn CredentialsProvider>::global(cx);
+
+        self.remote_owner = Some(owner);
+        self.remote_repo = Some(repo_name);
+
+        cx.spawn(async move |this, cx| {
+            let token = resolve_github_token(credentials_provider, cx).await;
+
+            let provider: Arc<dyn ReviewProvider> =
+                Arc::new(GitHubProvider::new(http_client, token));
+
+            this.update(cx, |this, cx| {
+                this.provider = Some(provider);
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn load_pull_requests(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        let Some(owner) = self.remote_owner.clone() else {
+            return;
+        };
+        let Some(repo) = self.remote_repo.clone() else {
+            return;
+        };
+
+        let state = self.pr_filter.clone();
+        self.pr_list_loading = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let pull_requests = provider.fetch_pull_requests(&owner, &repo, state).await?;
+            this.update(cx, |this, cx| {
+                this.pull_requests = pull_requests;
+                this.pr_list_loading = false;
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn select_pull_request(&mut self, pr: &PullRequestInfo, cx: &mut Context<Self>) {
+        self.base_branch = Some(pr.base_ref.clone());
+        self.head_branch = Some(pr.head_ref.clone());
+        self.load_diff(cx);
     }
 
     fn load_branches(&mut self, cx: &mut Context<Self>) {
@@ -579,6 +729,193 @@ impl ReviewPanel {
             }))
             .into_any_element()
     }
+
+    fn render_pull_request_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.provider.is_none() {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .gap_2()
+                .child(Label::new("No GitHub remote detected").color(Color::Muted))
+                .child(
+                    Label::new("Push to a GitHub remote to see PRs")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+
+        if self.pr_list_loading && self.pull_requests.is_empty() {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .child(Label::new("Loading pull requests...").color(Color::Muted))
+                .into_any_element();
+        }
+
+        if self.pull_requests.is_empty() {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .child(Label::new("No pull requests found").color(Color::Muted))
+                .into_any_element();
+        }
+
+        let query = self
+            .pr_search_editor
+            .read(cx)
+            .text(cx)
+            .to_string()
+            .to_lowercase();
+
+        let filtered: Vec<_> = self
+            .pull_requests
+            .iter()
+            .filter(|pr| {
+                if query.is_empty() {
+                    return true;
+                }
+                let query_trimmed = query.trim_start_matches('#');
+                pr.number.to_string().contains(query_trimmed)
+                    || pr.author.to_lowercase().contains(&query)
+                    || pr.title.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+
+        let filter_label = match &self.pr_filter {
+            PullRequestState::Open => "Open",
+            PullRequestState::Closed => "Closed",
+            PullRequestState::Merged => "Merged",
+            PullRequestState::All => "All",
+        };
+        let weak_panel = cx.weak_entity();
+
+        v_flex()
+            .id("review-pr-list")
+            .size_full()
+            .overflow_scroll()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .items_center()
+                    .child(div().flex_1().child(self.pr_search_editor.clone()))
+                    .child(
+                        PopoverMenu::new("pr-filter-menu")
+                            .trigger(
+                                IconButton::new("pr-filter-trigger", IconName::Filter)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text(format!("Filter: {}", filter_label))),
+                            )
+                            .anchor(Corner::TopRight)
+                            .with_handle(self.pr_filter_menu_handle.clone())
+                            .menu({
+                                let weak_panel = weak_panel.clone();
+                                move |window, cx| {
+                                    let weak_panel = weak_panel.clone();
+                                    Some(ContextMenu::build(
+                                        window,
+                                        cx,
+                                        move |menu, _window, _cx| {
+                                            menu.entry("Open", None, {
+                                                let weak_panel = weak_panel.clone();
+                                                move |_window, cx| {
+                                                    weak_panel
+                                                        .update(cx, |this, cx| {
+                                                            this.set_pr_filter(
+                                                                PullRequestState::Open,
+                                                                cx,
+                                                            );
+                                                        })
+                                                        .ok();
+                                                }
+                                            })
+                                            .entry("Closed", None, {
+                                                let weak_panel = weak_panel.clone();
+                                                move |_window, cx| {
+                                                    weak_panel
+                                                        .update(cx, |this, cx| {
+                                                            this.set_pr_filter(
+                                                                PullRequestState::Closed,
+                                                                cx,
+                                                            );
+                                                        })
+                                                        .ok();
+                                                }
+                                            })
+                                            .entry("All", None, {
+                                                let weak_panel = weak_panel.clone();
+                                                move |_window, cx| {
+                                                    weak_panel
+                                                        .update(cx, |this, cx| {
+                                                            this.set_pr_filter(
+                                                                PullRequestState::All,
+                                                                cx,
+                                                            );
+                                                        })
+                                                        .ok();
+                                                }
+                                            })
+                                        },
+                                    ))
+                                }
+                            }),
+                    ),
+            )
+            .child(
+                h_flex().px_2().pb_1().child(
+                    Label::new(format!("{} {} pull requests", filtered.len(), filter_label))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .children(filtered.into_iter().map(|pr| {
+                let number = pr.number;
+                let title = pr.title.clone();
+                let author = pr.author.clone();
+                let updated = pr.updated_at.clone();
+
+                h_flex()
+                    .id(SharedString::from(format!("pr_{}", number)))
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .rounded_md()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .child(
+                        Label::new(format!("#{}", number))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        v_flex()
+                            .overflow_x_hidden()
+                            .child(
+                                Label::new(title.to_string())
+                                    .size(LabelSize::Small)
+                                    .single_line(),
+                            )
+                            .child(
+                                Label::new(format!("by {} · {}", author, updated))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
+                    )
+                    .on_click({
+                        let pr = pr.clone();
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.select_pull_request(&pr, cx);
+                        })
+                    })
+            }))
+            .into_any_element()
+    }
 }
 
 impl Render for ReviewPanel {
@@ -596,13 +933,7 @@ impl Render for ReviewPanel {
                         .items_center()
                         .child(Label::new("No review selected").color(Color::Muted)),
                 ),
-                ActiveView::PullRequestList => parent.child(
-                    v_flex()
-                        .size_full()
-                        .justify_center()
-                        .items_center()
-                        .child(Label::new("PR List (coming soon)").color(Color::Muted)),
-                ),
+                ActiveView::PullRequestList => parent.child(self.render_pull_request_list(cx)),
                 ActiveView::ReviewThread => parent.child(
                     v_flex()
                         .size_full()
@@ -683,4 +1014,29 @@ impl Panel for ReviewPanel {
     fn activation_priority(&self) -> u32 {
         10
     }
+}
+
+fn parse_github_remote(url: &str) -> anyhow::Result<(String, String)> {
+    // Handle SSH: git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let rest = rest.trim_end_matches(".git");
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    // Handle HTTPS: https://github.com/owner/repo.git
+    if let Some(rest) = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+    {
+        let rest = rest.trim_end_matches(".git");
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    anyhow::bail!("Could not parse GitHub owner/repo from remote URL: {}", url)
 }
