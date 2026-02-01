@@ -2,7 +2,7 @@ use gpui::SharedString;
 use std::future::Future;
 use std::pin::Pin;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PullRequestState {
     Open,
     Closed,
@@ -101,6 +101,13 @@ pub trait ReviewProvider: Send + Sync {
         repo: &str,
         state: PullRequestState,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<PullRequestInfo>>> + Send>>;
+
+    fn fetch_pull_request_details(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestDetails>> + Send>>;
 
     fn fetch_pull_request_files(
         &self,
