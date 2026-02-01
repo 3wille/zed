@@ -314,17 +314,22 @@ impl ReviewPanel {
         }
     }
 
-    fn render_file_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(tree_diff) = &self.tree_diff else {
-            return v_flex()
-                .size_full()
-                .justify_center()
-                .items_center()
-                .child(Label::new("Loading...").color(Color::Muted))
-                .into_any_element();
-        };
+    fn entry_count(&self) -> usize {
+        self.tree_diff
+            .as_ref()
+            .map(|d| d.entries.len())
+            .unwrap_or(0)
+    }
 
-        let mut entries: Vec<_> = tree_diff.entries.iter().collect();
+    fn sorted_entries(&self) -> Vec<(RepoPath, TreeDiffStatus)> {
+        let Some(tree_diff) = &self.tree_diff else {
+            return Vec::new();
+        };
+        let mut entries: Vec<_> = tree_diff
+            .entries
+            .iter()
+            .map(|(p, s)| (p.clone(), s.clone()))
+            .collect();
         entries.sort_by(|(path_a, status_a), (path_b, status_b)| {
             let order = |s: &TreeDiffStatus| match s {
                 TreeDiffStatus::Added => 0,
@@ -335,6 +340,64 @@ impl ReviewPanel {
                 .cmp(&order(status_b))
                 .then(path_a.cmp(path_b))
         });
+        entries
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.entry_count();
+        if count == 0 {
+            return;
+        }
+        let next = match self.selected_entry {
+            Some(current) if current + 1 < count => current + 1,
+            None => 0,
+            _ => return,
+        };
+        self.selected_entry = Some(next);
+        cx.notify();
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = self.entry_count();
+        if count == 0 {
+            return;
+        }
+        let prev = match self.selected_entry {
+            Some(current) if current > 0 => current - 1,
+            None => 0,
+            _ => return,
+        };
+        self.selected_entry = Some(prev);
+        cx.notify();
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected_entry else {
+            return;
+        };
+        let entries = self.sorted_entries();
+        if let Some((path, _)) = entries.get(selected) {
+            let path = path.clone();
+            self.open_file_diff(path, window, cx);
+        }
+    }
+
+    fn render_file_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.tree_diff.is_none() {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .child(Label::new("Loading...").color(Color::Muted))
+                .into_any_element();
+        }
+
+        let entries = self.sorted_entries();
 
         let header_text = format!(
             "{} <- {}",
@@ -355,15 +418,23 @@ impl ReviewPanel {
             .iter()
             .filter(|(_, s)| matches!(s, TreeDiffStatus::Deleted { .. }))
             .count();
+        let viewed_count = self.viewed_files.len();
 
         let summary = format!(
-            "{} changed files (+{} -{} ~{})",
-            file_count, added, deleted, modified
+            "{} changed files (+{} -{} ~{}) — {}/{} viewed",
+            file_count, added, deleted, modified, viewed_count, file_count
         );
+
+        let info_color = cx.theme().status().info;
+        let selected_bg_alpha = 0.08;
+
         v_flex()
             .id("review-file-list")
             .size_full()
             .overflow_scroll()
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::confirm))
             .child(
                 h_flex().px_2().py_1().child(
                     Label::new(header_text)
@@ -378,26 +449,52 @@ impl ReviewPanel {
                         .color(Color::Muted),
                 ),
             )
-            .children(entries.into_iter().map(|(path, status)| {
-                let (icon, color) = match status {
+            .children(entries.into_iter().enumerate().map(|(ix, (path, status))| {
+                let (icon, color) = match &status {
                     TreeDiffStatus::Added => (IconName::Plus, Color::Created),
                     TreeDiffStatus::Modified { .. } => (IconName::Pencil, Color::Modified),
                     TreeDiffStatus::Deleted { .. } => (IconName::Dash, Color::Deleted),
                 };
 
+                let is_selected = self.selected_entry == Some(ix);
+                let is_viewed = self.viewed_files.contains(&path);
+                let label_color = if is_viewed { Color::Muted } else { Color::Default };
+
+                let bg = if is_selected {
+                    info_color.alpha(selected_bg_alpha)
+                } else {
+                    cx.theme().colors().ghost_element_background
+                };
+
+                let hover_bg = if is_selected {
+                    info_color.alpha(selected_bg_alpha + 0.04)
+                } else {
+                    cx.theme().colors().ghost_element_hover
+                };
+
                 h_flex()
-                    .id(SharedString::from(
-                        path.as_std_path().to_string_lossy().to_string(),
-                    ))
+                    .id(SharedString::from(format!("file_entry_{}", ix)))
                     .px_2()
                     .py_1()
                     .gap_2()
                     .rounded_md()
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .bg(bg)
+                    .hover(move |style| style.bg(hover_bg))
+                    .when(!is_viewed, |row| {
+                        row.child(
+                            div()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .bg(cx.theme().status().info),
+                        )
+                    })
+                    .when(is_viewed, |row| row.child(div().w(px(6.)).h(px(6.))))
                     .child(Icon::new(icon).size(IconSize::Small).color(color))
                     .child(
                         Label::new(path.as_std_path().to_string_lossy().to_string())
-                            .size(LabelSize::Small),
+                            .size(LabelSize::Small)
+                            .color(label_color),
                     )
                     .on_click({
                         let path = path.clone();
