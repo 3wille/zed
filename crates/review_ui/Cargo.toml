@@ -14,6 +14,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+log.workspace = true
 fs.workspace = true
 gpui.workspace = true
 schemars.workspace = true
@@ -33,3 +34,4 @@ smol.workspace = true
 http_client.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+git_hosting_providers.workspace = true
