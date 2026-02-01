@@ -221,6 +221,33 @@ impl ReviewProvider for GitHubProvider {
         })
     }
 
+    fn fetch_pull_request_details(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestDetails>> + Send>> {
+        let pr_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}");
+        let files_url =
+            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100");
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let gh_pr: GhPullRequest = github_get(&http_client, &token, &pr_url).await?;
+            let gh_files: Vec<GhFile> = github_get(&http_client, &token, &files_url).await?;
+
+            Ok(PullRequestDetails {
+                info: map_pull_request(gh_pr),
+                files: gh_files.into_iter().map(map_file).collect(),
+                comments: Vec::new(),
+                checks: Vec::new(),
+                mergeable: None,
+                labels: Vec::new(),
+            })
+        })
+    }
+
     fn fetch_pull_request_files(
         &self,
         owner: &str,
