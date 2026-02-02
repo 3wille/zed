@@ -32,7 +32,7 @@ use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
-use zed_actions::review_panel::ToggleFocus;
+use zed_actions::review_panel::{OpenLocalFile, ToggleFocus};
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
@@ -84,6 +84,7 @@ pub struct ReviewPanel {
     comment_submitting: bool,
     review_action: ReviewStatus,
     review_action_menu_handle: PopoverMenuHandle<ContextMenu>,
+    pr_ref_fetch_task: Option<gpui::Task<Result<()>>>,
 }
 
 pub fn register(workspace: &mut Workspace) {
@@ -186,6 +187,7 @@ impl ReviewPanel {
             comment_submitting: false,
             review_action: ReviewStatus::Commented,
             review_action_menu_handle: PopoverMenuHandle::default(),
+            pr_ref_fetch_task: None,
         };
         this.initialize_provider(cx);
         this.load_branches(cx);
@@ -420,8 +422,41 @@ impl ReviewPanel {
 
         self.load_pr_comments(pr.number, cx);
         self.load_pr_api_files(pr.number, cx);
-        self.load_diff(cx);
+        self.fetch_pr_ref(pr.number, cx);
         self.set_active_view(ActiveView::ReviewThread, cx);
+    }
+
+    fn fetch_pr_ref(&mut self, pr_number: u32, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+
+        let work_dir = repo.read(cx).snapshot().work_directory_abs_path.clone();
+        let refspec = format!("pull/{}/head", pr_number);
+
+        self.pr_ref_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let output = smol::process::Command::new("git")
+                .current_dir(work_dir.as_ref())
+                .args(["fetch", "origin", &refspec])
+                .output()
+                .await?;
+
+            if output.status.success() {
+                log::info!("review_panel: fetched PR #{} ref", pr_number);
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::warn!(
+                    "review_panel: PR #{} ref fetch failed: {}",
+                    pr_number,
+                    stderr
+                );
+            }
+
+            this.update(cx, |this, cx| {
+                this.load_diff(cx);
+            })?;
+            anyhow::Ok(())
+        }));
     }
 
     fn load_pr_comments(&mut self, pr_number: u32, cx: &mut Context<Self>) {
@@ -524,13 +559,7 @@ impl ReviewPanel {
                 };
                 cx.spawn_in(window, async move |this, cx| {
                     provider
-                        .submit_review(
-                            &owner,
-                            &repo,
-                            pr_number,
-                            action,
-                            body_opt.as_deref(),
-                        )
+                        .submit_review(&owner, &repo, pr_number, action, body_opt.as_deref())
                         .await?;
                     this.update_in(cx, |this, window, cx| {
                         this.comment_submitting = false;
@@ -557,10 +586,7 @@ impl ReviewPanel {
         }
     }
 
-    fn render_review_action_button(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_review_action_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self.review_action_label();
         let is_submitting = self.comment_submitting;
 
@@ -575,11 +601,7 @@ impl ReviewPanel {
                 .layer(ElevationIndex::ModalSurface)
                 .size(ButtonSize::Compact)
                 .disabled(is_submitting)
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::Small)
-                        .color(label_color),
-                )
+                .child(Label::new(label).size(LabelSize::Small).color(label_color))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.submit_review_action(window, cx);
                 })),
@@ -587,10 +609,7 @@ impl ReviewPanel {
         )
     }
 
-    fn render_review_action_menu(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_review_action_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak_panel = cx.weak_entity();
         let current = self.review_action.clone();
 
@@ -615,58 +634,57 @@ impl ReviewPanel {
                 let weak_panel = weak_panel.clone();
                 let current = current.clone();
                 Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu
-                        .toggleable_entry(
-                            "Comment",
-                            matches!(current, ReviewStatus::Commented),
-                            IconPosition::Start,
-                            None,
-                            {
-                                let weak_panel = weak_panel.clone();
-                                move |_window, cx| {
-                                    weak_panel
-                                        .update(cx, |this, cx| {
-                                            this.review_action = ReviewStatus::Commented;
-                                            cx.notify();
-                                        })
-                                        .ok();
-                                }
-                            },
-                        )
-                        .toggleable_entry(
-                            "Approve",
-                            matches!(current, ReviewStatus::Approved),
-                            IconPosition::Start,
-                            None,
-                            {
-                                let weak_panel = weak_panel.clone();
-                                move |_window, cx| {
-                                    weak_panel
-                                        .update(cx, |this, cx| {
-                                            this.review_action = ReviewStatus::Approved;
-                                            cx.notify();
-                                        })
-                                        .ok();
-                                }
-                            },
-                        )
-                        .toggleable_entry(
-                            "Request Changes",
-                            matches!(current, ReviewStatus::ChangesRequested),
-                            IconPosition::Start,
-                            None,
-                            {
-                                let weak_panel = weak_panel.clone();
-                                move |_window, cx| {
-                                    weak_panel
-                                        .update(cx, |this, cx| {
-                                            this.review_action = ReviewStatus::ChangesRequested;
-                                            cx.notify();
-                                        })
-                                        .ok();
-                                }
-                            },
-                        )
+                    menu.toggleable_entry(
+                        "Comment",
+                        matches!(current, ReviewStatus::Commented),
+                        IconPosition::Start,
+                        None,
+                        {
+                            let weak_panel = weak_panel.clone();
+                            move |_window, cx| {
+                                weak_panel
+                                    .update(cx, |this, cx| {
+                                        this.review_action = ReviewStatus::Commented;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                        },
+                    )
+                    .toggleable_entry(
+                        "Approve",
+                        matches!(current, ReviewStatus::Approved),
+                        IconPosition::Start,
+                        None,
+                        {
+                            let weak_panel = weak_panel.clone();
+                            move |_window, cx| {
+                                weak_panel
+                                    .update(cx, |this, cx| {
+                                        this.review_action = ReviewStatus::Approved;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                        },
+                    )
+                    .toggleable_entry(
+                        "Request Changes",
+                        matches!(current, ReviewStatus::ChangesRequested),
+                        IconPosition::Start,
+                        None,
+                        {
+                            let weak_panel = weak_panel.clone();
+                            move |_window, cx| {
+                                weak_panel
+                                    .update(cx, |this, cx| {
+                                        this.review_action = ReviewStatus::ChangesRequested;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                        },
+                    )
                 }))
             })
     }
@@ -793,6 +811,34 @@ impl ReviewPanel {
         }
     }
 
+    fn open_local_file(&mut self, _: &OpenLocalFile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected_entry else {
+            return;
+        };
+        let entries = self.sorted_entries();
+        let Some((path, status)) = entries.get(selected) else {
+            return;
+        };
+        if matches!(status, TreeDiffStatus::Deleted { .. }) {
+            return;
+        }
+        let Some(active_repo) = self.active_repository.as_ref() else {
+            return;
+        };
+        let Some(project_path) = active_repo.read(cx).repo_path_to_project_path(path, cx) else {
+            return;
+        };
+        let Some(workspace) = self._workspace.upgrade() else {
+            return;
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .open_path_preview(project_path, None, true, false, true, window, cx)
+                .detach_and_log_err(cx);
+        });
+    }
+
     fn entry_count(&self) -> usize {
         self.tree_diff
             .as_ref()
@@ -881,8 +927,7 @@ impl ReviewPanel {
         let file_count = self.pr_api_files.len();
 
         // Group comments by file path
-        let mut file_comments: HashMap<SharedString, Vec<ReviewComment>> =
-            HashMap::default();
+        let mut file_comments: HashMap<SharedString, Vec<ReviewComment>> = HashMap::default();
         let mut general_comments: Vec<ReviewComment> = Vec::new();
         for comment in &self.pr_comments {
             if let Some(path) = &comment.path {
@@ -933,7 +978,11 @@ impl ReviewPanel {
             };
 
         // Scrollable content
-        let mut scrollable = v_flex().id("review-scrollable").flex_1().overflow_scroll().gap_1();
+        let mut scrollable = v_flex()
+            .id("review-scrollable")
+            .flex_1()
+            .overflow_scroll()
+            .gap_1();
 
         // File entries with inline comments
         for (path, status, additions, deletions) in &file_entries {
@@ -1002,17 +1051,11 @@ impl ReviewPanel {
         // General comments section
         if !general_comments.is_empty() {
             scrollable = scrollable.child(
-                h_flex()
-                    .px_2()
-                    .pt_2()
-                    .child(
-                        Label::new(format!(
-                            "General comments ({})",
-                            general_comments.len()
-                        ))
+                h_flex().px_2().pt_2().child(
+                    Label::new(format!("General comments ({})", general_comments.len()))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
-                    ),
+                ),
             );
             for comment in &general_comments {
                 scrollable = scrollable.child(self.render_comment_card(comment, cx));
@@ -1022,20 +1065,18 @@ impl ReviewPanel {
         // Loading indicator for comments
         if self.pr_comments_loading {
             scrollable = scrollable.child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .child(
-                        Label::new("Loading comments...")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                h_flex().px_2().py_1().child(
+                    Label::new("Loading comments...")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
             );
         }
 
         v_flex()
             .id("review-thread")
             .size_full()
+            .on_action(cx.listener(Self::open_local_file))
             // PR header (fixed top)
             .child(
                 h_flex()
@@ -1349,6 +1390,7 @@ impl ReviewPanel {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::open_local_file))
             .child(
                 h_flex().px_2().py_1().child(
                     Label::new(header_text)

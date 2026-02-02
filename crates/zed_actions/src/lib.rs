@@ -707,7 +707,9 @@ pub mod review_panel {
         review_ui,
         [
             /// Toggles focus on the review UI.
-            ToggleFocus
+            ToggleFocus,
+            /// Opens the selected file in the editor (working tree version).
+            OpenLocalFile
         ]
     );
 }
