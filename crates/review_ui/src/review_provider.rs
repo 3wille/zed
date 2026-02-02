@@ -43,6 +43,7 @@ pub struct ReviewComment {
     pub path: Option<SharedString>,
     pub line: Option<u32>,
     pub reply_to: Option<u64>,
+    pub diff_hunk: Option<SharedString>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +89,8 @@ pub struct PullRequestInfo {
     pub state: PullRequestState,
     pub base_ref: SharedString,
     pub head_ref: SharedString,
+    pub base_sha: SharedString,
+    pub head_sha: SharedString,
     pub created_at: SharedString,
     pub updated_at: SharedString,
     pub review_status: ReviewStatus,
