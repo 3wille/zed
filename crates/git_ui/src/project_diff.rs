@@ -190,6 +190,74 @@ impl ProjectDiff {
             .detach_and_notify_err(workspace, window, cx);
     }
 
+    pub fn deploy_merge_diff(
+        workspace: &mut Workspace,
+        base_ref: SharedString,
+        head_ref: Option<SharedString>,
+        project_path: Option<ProjectPath>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let project = workspace.project().clone();
+
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            match item.read(cx).diff_base(cx) {
+                DiffBase::Merge {
+                    base_ref: existing_base,
+                    head_ref: existing_head,
+                } if *existing_base == base_ref && *existing_head == head_ref => true,
+                _ => false,
+            }
+        });
+
+        if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            if let Some(path) = project_path {
+                existing.update(cx, |diff, cx| {
+                    diff.move_to_project_path(&path, window, cx);
+                });
+            }
+            return;
+        }
+
+        let base_ref_clone = base_ref.clone();
+        let head_ref_clone = head_ref.clone();
+        let workspace_handle = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                let branch_diff = cx.new_window_entity(|window, cx| {
+                    branch_diff::BranchDiff::new(
+                        DiffBase::Merge {
+                            base_ref: base_ref_clone,
+                            head_ref: head_ref_clone,
+                        },
+                        project.clone(),
+                        window,
+                        cx,
+                    )
+                })?;
+                let this = cx.new_window_entity(|window, cx| {
+                    Self::new_impl(branch_diff, project, workspace_handle.clone(), window, cx)
+                })?;
+                workspace_handle.update_in(cx, |workspace, window, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(this.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    if let Some(path) = project_path {
+                        this.update(cx, |diff, cx| {
+                            diff.move_to_project_path(&path, window, cx);
+                        });
+                    }
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_notify_err(window, cx);
+    }
+
     pub fn deploy_at(
         workspace: &mut Workspace,
         entry: Option<GitStatusEntry>,
@@ -311,6 +379,7 @@ impl ProjectDiff {
                 branch_diff::BranchDiff::new(
                     DiffBase::Merge {
                         base_ref: main_branch,
+                        head_ref: None,
                     },
                     project.clone(),
                     window,
@@ -973,7 +1042,7 @@ impl Item for ProjectDiff {
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.branch_diff.read(cx).diff_base() {
             DiffBase::Head => "Uncommitted Changes".into(),
-            DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
+            DiffBase::Merge { base_ref, .. } => format!("Changes since {}", base_ref).into(),
         }
     }
 

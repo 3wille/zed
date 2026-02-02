@@ -32,6 +32,7 @@ struct GhUser {
 struct GhRef {
     #[serde(rename = "ref")]
     ref_name: String,
+    sha: String,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +53,7 @@ struct GhReviewComment {
     path: Option<String>,
     line: Option<u32>,
     in_reply_to_id: Option<u64>,
+    diff_hunk: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +158,8 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         state: map_pr_state(&pr.state),
         base_ref: pr.base.ref_name.into(),
         head_ref: pr.head.ref_name.into(),
+        base_sha: pr.base.sha.into(),
+        head_sha: pr.head.sha.into(),
         created_at: pr.created_at.into(),
         updated_at: pr.updated_at.into(),
         review_status: ReviewStatus::Pending,
@@ -180,6 +184,7 @@ fn map_review_comment(comment: GhReviewComment) -> ReviewComment {
         path: comment.path.map(SharedString::from),
         line: comment.line,
         reply_to: comment.in_reply_to_id,
+        diff_hunk: comment.diff_hunk.map(SharedString::from),
     }
 }
 
@@ -301,6 +306,7 @@ impl ReviewProvider for GitHubProvider {
                             path: None,
                             line: None,
                             reply_to: None,
+                            diff_hunk: None,
                         });
                     }
                 }
@@ -337,6 +343,7 @@ impl ReviewProvider for GitHubProvider {
                 path,
                 line,
                 reply_to: None,
+                diff_hunk: None,
             })
         })
     }
