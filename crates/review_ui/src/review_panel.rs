@@ -41,6 +41,7 @@ struct RecentReview {
     base_branch: SharedString,
     head_branch: SharedString,
     file_count: usize,
+    pull_request: Option<PullRequestInfo>,
 }
 
 enum ActiveView {
@@ -249,19 +250,37 @@ impl ReviewPanel {
 
                         menu = menu.header("Recent");
                         for entry in &recent {
-                            let label = format!(
-                                "{}..{} ({} files)",
-                                entry.base_branch, entry.head_branch, entry.file_count
-                            );
+                            let label = if let Some(pr) = &entry.pull_request {
+                                format!(
+                                    "#{} {}..{} ({} files)",
+                                    pr.number,
+                                    entry.base_branch,
+                                    entry.head_branch,
+                                    entry.file_count
+                                )
+                            } else {
+                                format!(
+                                    "{}..{} ({} files)",
+                                    entry.base_branch,
+                                    entry.head_branch,
+                                    entry.file_count
+                                )
+                            };
                             let base = entry.base_branch.clone();
                             let head = entry.head_branch.clone();
+                            let pull_request = entry.pull_request.clone();
                             let weak_panel = weak_panel.clone();
                             menu = menu.entry(label, None, move |_window, cx| {
                                 weak_panel
                                     .update(cx, |this, cx| {
                                         this.base_branch = Some(base.clone());
                                         this.head_branch = Some(head.clone());
-                                        this.load_diff(cx);
+                                        if let Some(pr) = &pull_request {
+                                            this.select_pull_request(pr, cx);
+                                        } else {
+                                            this.selected_pr = None;
+                                            this.load_diff(cx);
+                                        }
                                     })
                                     .ok();
                             });
@@ -756,6 +775,7 @@ impl ReviewPanel {
                 if let (Some(base), Some(head)) =
                     (this.base_branch.clone(), this.head_branch.clone())
                 {
+                    let pull_request = this.selected_pr.clone();
                     this.recent_reviews
                         .retain(|r| !(r.base_branch == base && r.head_branch == head));
                     this.recent_reviews.insert(
@@ -764,8 +784,10 @@ impl ReviewPanel {
                             base_branch: base,
                             head_branch: head,
                             file_count,
+                            pull_request,
                         },
                     );
+                    this.recent_reviews.truncate(10);
                 }
 
                 this.viewed_files.clear();
