@@ -1,4 +1,7 @@
+use crate::comment_card::CommentCard;
+use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
+use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
 use crate::github_token::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
 use crate::review_provider::{
@@ -6,15 +9,15 @@ use crate::review_provider::{
     ReviewProvider, ReviewStatus,
 };
 use anyhow::Result;
-use collections::{HashMap, HashSet};
+use collections::HashMap;
 use credentials_provider::CredentialsProvider;
-use editor::{Editor, EditorEvent};
+use editor::Editor;
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff, TreeDiffStatus};
 use gpui::{
     App, AsyncWindowContext, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
-    Render, SharedString, WeakEntity, Window,
+    Render, SharedString, Subscription, WeakEntity, Window,
 };
 use http_client::HttpClient;
 use project::{
@@ -32,7 +35,7 @@ use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
-use zed_actions::review_panel::{OpenLocalFile, ToggleFocus};
+use zed_actions::review_panel::ToggleFocus;
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
@@ -52,6 +55,11 @@ enum ActiveView {
     Configuration,
 }
 
+enum PendingFileAction {
+    OpenDiff(RepoPath),
+    OpenLocal(RepoPath),
+}
+
 pub struct ReviewPanel {
     _workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -59,8 +67,7 @@ pub struct ReviewPanel {
     base_branch: Option<SharedString>,
     head_branch: Option<SharedString>,
     tree_diff: Option<TreeDiff>,
-    viewed_files: HashSet<RepoPath>,
-    selected_entry: Option<usize>,
+    file_list: Option<(Entity<FileList>, Subscription)>,
     focus_handle: FocusHandle,
     recent_reviews_menu_handle: PopoverMenuHandle<ContextMenu>,
     options_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -69,14 +76,10 @@ pub struct ReviewPanel {
     active_view: ActiveView,
     recent_reviews: Vec<RecentReview>,
     http_client: Arc<dyn HttpClient>,
-    pull_requests: Vec<PullRequestInfo>,
-    pr_list_loading: bool,
-    pr_filter: PullRequestState,
-    pr_filter_menu_handle: PopoverMenuHandle<ContextMenu>,
+    pull_request_list: Option<(Entity<PullRequestList>, Subscription)>,
     provider: Option<Arc<dyn ReviewProvider>>,
     remote_owner: Option<String>,
     remote_repo: Option<String>,
-    pr_search_editor: Entity<Editor>,
     selected_pr: Option<PullRequestInfo>,
     pr_comments: Vec<ReviewComment>,
     pr_comments_loading: bool,
@@ -86,6 +89,7 @@ pub struct ReviewPanel {
     review_action: ReviewStatus,
     review_action_menu_handle: PopoverMenuHandle<ContextMenu>,
     pr_ref_fetch_task: Option<gpui::Task<Result<()>>>,
+    pending_file_action: Option<PendingFileAction>,
 }
 
 pub fn register(workspace: &mut Workspace) {
@@ -128,23 +132,6 @@ impl ReviewPanel {
         )
         .detach();
 
-        let pr_search_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Filter by # or author...", window, cx);
-            editor
-        });
-
-        cx.subscribe_in(
-            &pr_search_editor,
-            window,
-            |_this, _editor, event: &EditorEvent, _window, cx| {
-                if matches!(event, EditorEvent::BufferEdited { .. }) {
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
-
         let comment_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(3, 6, window, cx);
             editor.set_placeholder_text("Leave a comment…", window, cx);
@@ -162,8 +149,7 @@ impl ReviewPanel {
             base_branch: None,
             head_branch: None,
             tree_diff: None,
-            viewed_files: HashSet::default(),
-            selected_entry: None,
+            file_list: None,
             focus_handle: cx.focus_handle(),
             fs,
             width: None,
@@ -172,14 +158,10 @@ impl ReviewPanel {
             active_view: ActiveView::Empty,
             recent_reviews: Vec::new(),
             http_client: workspace.client().http_client().clone(),
-            pull_requests: Vec::new(),
-            pr_list_loading: false,
-            pr_filter: PullRequestState::Open,
-            pr_filter_menu_handle: PopoverMenuHandle::default(),
+            pull_request_list: None,
             provider: None,
             remote_owner: None,
             remote_repo: None,
-            pr_search_editor,
             selected_pr: None,
             pr_comments: Vec::new(),
             pr_comments_loading: false,
@@ -189,6 +171,7 @@ impl ReviewPanel {
             review_action: ReviewStatus::Commented,
             review_action_menu_handle: PopoverMenuHandle::default(),
             pr_ref_fetch_task: None,
+            pending_file_action: None,
         };
         this.initialize_provider(cx);
         this.load_branches(cx);
@@ -207,21 +190,12 @@ impl ReviewPanel {
 
     fn set_active_view(&mut self, new_view: ActiveView, cx: &mut Context<Self>) {
         self.active_view = new_view;
-        if matches!(self.active_view, ActiveView::PullRequestList) && self.pull_requests.is_empty()
-        {
-            self.load_pull_requests(cx);
-        }
         cx.notify();
     }
 
     fn refresh_pull_requests(&mut self, cx: &mut Context<Self>) {
-        self.load_pull_requests(cx);
-    }
-
-    fn set_pr_filter(&mut self, state: PullRequestState, cx: &mut Context<Self>) {
-        if self.pr_filter != state {
-            self.pr_filter = state;
-            self.load_pull_requests(cx);
+        if let Some((pr_list, _)) = &self.pull_request_list {
+            pr_list.update(cx, |list, cx| list.refresh(cx));
         }
     }
 
@@ -357,8 +331,8 @@ impl ReviewPanel {
                         IconButton::new("new-review", IconName::Plus)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("New Review"))
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.set_active_view(ActiveView::PullRequestList, cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_pull_request_list(window, cx);
                             })),
                     )
                     .child(self.render_recent_reviews_menu(cx))
@@ -398,37 +372,17 @@ impl ReviewPanel {
                 Arc::new(GitHubProvider::new(http_client, token));
 
             this.update(cx, |this, cx| {
-                this.provider = Some(provider);
+                this.provider = Some(provider.clone());
+                if let (Some((pr_list, _)), Some(owner), Some(repo)) =
+                    (&this.pull_request_list, this.remote_owner.clone(), this.remote_repo.clone())
+                {
+                    pr_list.update(cx, |list, cx| {
+                        list.set_provider(provider, owner, repo, cx);
+                    });
+                }
                 cx.notify();
             })?;
 
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    }
-
-    fn load_pull_requests(&mut self, cx: &mut Context<Self>) {
-        let Some(provider) = self.provider.clone() else {
-            return;
-        };
-        let Some(owner) = self.remote_owner.clone() else {
-            return;
-        };
-        let Some(repo) = self.remote_repo.clone() else {
-            return;
-        };
-
-        let state = self.pr_filter.clone();
-        self.pr_list_loading = true;
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let pull_requests = provider.fetch_pull_requests(&owner, &repo, state).await?;
-            this.update(cx, |this, cx| {
-                this.pull_requests = pull_requests;
-                this.pr_list_loading = false;
-                cx.notify();
-            })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -790,147 +744,133 @@ impl ReviewPanel {
                     this.recent_reviews.truncate(10);
                 }
 
-                this.viewed_files.clear();
-                this.selected_entry = None;
-                this.set_active_view(ActiveView::FileList, cx);
+                this.show_file_list(cx);
             })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }
 
-    fn open_file_diff(&mut self, path: RepoPath, window: &mut Window, cx: &mut Context<Self>) {
-        self.viewed_files.insert(path.clone());
-        let entries = self.sorted_entries();
-        self.selected_entry = entries.iter().position(|(p, _)| *p == path);
+    fn show_file_list(&mut self, cx: &mut Context<Self>) {
+        let file_list = cx.new(|cx| {
+            FileList::new(
+                self.base_branch.clone(),
+                self.head_branch.clone(),
+                self.tree_diff.as_ref(),
+                cx,
+            )
+        });
+        let subscription = cx.subscribe(&file_list, |this, _file_list, event, cx| match event {
+            FileListEvent::OpenFileDiff(path) => {
+                this.open_file_diff(path.clone(), cx);
+            }
+            FileListEvent::OpenLocalFile(path) => {
+                this.open_local_file_by_path(path.clone(), cx);
+            }
+        });
+        self.file_list = Some((file_list, subscription));
+        self.active_view = ActiveView::FileList;
         cx.notify();
+    }
 
-        let Some(workspace) = self._workspace.upgrade() else {
-            return;
-        };
-        let Some(active_repo) = self.active_repository.as_ref() else {
-            return;
-        };
-        let Some(project_path) = active_repo.read(cx).repo_path_to_project_path(&path, cx) else {
-            return;
-        };
-
-        if let Some(pr) = self.selected_pr.as_ref() {
-            let base_ref = pr.base_ref.clone();
-            let head_ref = Some(pr.head_sha.clone());
-            workspace.update(cx, |workspace, cx| {
-                git_ui::project_diff::ProjectDiff::deploy_merge_diff(
-                    workspace,
-                    base_ref,
-                    head_ref,
-                    Some(project_path),
+    fn show_pull_request_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pull_request_list.is_none() {
+            let pr_list = cx.new(|cx| {
+                PullRequestList::new(
+                    self.provider.clone(),
+                    self.remote_owner.clone(),
+                    self.remote_repo.clone(),
                     window,
                     cx,
-                );
+                )
             });
-        } else {
-            window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
+            let subscription =
+                cx.subscribe(&pr_list, |this, _pr_list, event, cx| match event {
+                    PullRequestListEvent::Selected(pr) => {
+                        this.select_pull_request(&pr.clone(), cx);
+                    }
+                });
+            self.pull_request_list = Some((pr_list, subscription));
         }
-    }
 
-    fn open_local_file(&mut self, _: &OpenLocalFile, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(selected) = self.selected_entry else {
-            return;
-        };
-        let entries = self.sorted_entries();
-        let Some((path, status)) = entries.get(selected) else {
-            return;
-        };
-        if matches!(status, TreeDiffStatus::Deleted { .. }) {
-            return;
+        if let Some((pr_list, _)) = &self.pull_request_list {
+            pr_list.update(cx, |list, cx| list.load_if_empty(cx));
         }
-        let Some(active_repo) = self.active_repository.as_ref() else {
-            return;
-        };
-        let Some(project_path) = active_repo.read(cx).repo_path_to_project_path(path, cx) else {
-            return;
-        };
-        let Some(workspace) = self._workspace.upgrade() else {
-            return;
-        };
 
-        workspace.update(cx, |workspace, cx| {
-            workspace
-                .open_path_preview(project_path, None, true, false, true, window, cx)
-                .detach_and_log_err(cx);
-        });
-    }
-
-    fn entry_count(&self) -> usize {
-        self.tree_diff
-            .as_ref()
-            .map(|d| d.entries.len())
-            .unwrap_or(0)
-    }
-
-    fn sorted_entries(&self) -> Vec<(RepoPath, TreeDiffStatus)> {
-        let Some(tree_diff) = &self.tree_diff else {
-            return Vec::new();
-        };
-        let mut entries: Vec<_> = tree_diff
-            .entries
-            .iter()
-            .map(|(p, s)| (p.clone(), s.clone()))
-            .collect();
-        entries.sort_by(|(path_a, status_a), (path_b, status_b)| {
-            let order = |s: &TreeDiffStatus| match s {
-                TreeDiffStatus::Added => 0,
-                TreeDiffStatus::Modified { .. } => 1,
-                TreeDiffStatus::Deleted { .. } => 2,
-            };
-            order(status_a)
-                .cmp(&order(status_b))
-                .then(path_a.cmp(path_b))
-        });
-        entries
-    }
-
-    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.entry_count();
-        if count == 0 {
-            return;
-        }
-        let next = match self.selected_entry {
-            Some(current) if current + 1 < count => current + 1,
-            None => 0,
-            _ => return,
-        };
-        self.selected_entry = Some(next);
+        self.active_view = ActiveView::PullRequestList;
         cx.notify();
     }
 
-    fn select_previous(
-        &mut self,
-        _: &menu::SelectPrevious,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let count = self.entry_count();
-        if count == 0 {
-            return;
+    fn open_file_diff(&mut self, path: RepoPath, cx: &mut Context<Self>) {
+        if let Some((file_list, _)) = &self.file_list {
+            file_list.update(cx, |fl, cx| {
+                fl.mark_viewed(path.clone(), cx);
+                fl.select_path(&path, cx);
+            });
         }
-        let prev = match self.selected_entry {
-            Some(current) if current > 0 => current - 1,
-            None => 0,
-            _ => return,
-        };
-        self.selected_entry = Some(prev);
+
+        self.pending_file_action = Some(PendingFileAction::OpenDiff(path));
         cx.notify();
     }
 
-    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(selected) = self.selected_entry else {
+    fn open_local_file_by_path(&mut self, path: RepoPath, cx: &mut Context<Self>) {
+        self.pending_file_action = Some(PendingFileAction::OpenLocal(path));
+        cx.notify();
+    }
+
+    fn flush_pending_file_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.pending_file_action.take() else {
             return;
         };
-        let entries = self.sorted_entries();
-        if let Some((path, _)) = entries.get(selected) {
-            let path = path.clone();
-            self.open_file_diff(path, window, cx);
+        match action {
+            PendingFileAction::OpenDiff(path) => {
+                let Some(workspace) = self._workspace.upgrade() else {
+                    return;
+                };
+                let Some(active_repo) = self.active_repository.as_ref() else {
+                    return;
+                };
+                let Some(project_path) =
+                    active_repo.read(cx).repo_path_to_project_path(&path, cx)
+                else {
+                    return;
+                };
+
+                if let Some(pr) = self.selected_pr.as_ref() {
+                    let base_ref = pr.base_ref.clone();
+                    let head_ref = Some(pr.head_sha.clone());
+                    workspace.update(cx, |workspace, cx| {
+                        git_ui::project_diff::ProjectDiff::deploy_merge_diff(
+                            workspace,
+                            base_ref,
+                            head_ref,
+                            Some(project_path),
+                            window,
+                            cx,
+                        );
+                    });
+                } else {
+                    window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
+                }
+            }
+            PendingFileAction::OpenLocal(path) => {
+                let Some(active_repo) = self.active_repository.as_ref() else {
+                    return;
+                };
+                let Some(project_path) =
+                    active_repo.read(cx).repo_path_to_project_path(&path, cx)
+                else {
+                    return;
+                };
+                let Some(workspace) = self._workspace.upgrade() else {
+                    return;
+                };
+                workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .open_path_preview(project_path, None, true, false, true, window, cx)
+                        .detach_and_log_err(cx);
+                });
+            }
         }
     }
     fn render_review_thread(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1053,8 +993,8 @@ impl ReviewPanel {
                 );
 
             let file_row = if let Some(repo_path) = repo_path {
-                file_row.on_click(cx.listener(move |this, _event, window, cx| {
-                    this.open_file_diff(repo_path.clone(), window, cx);
+                file_row.on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.open_file_diff(repo_path.clone(), cx);
                 }))
             } else {
                 file_row
@@ -1065,7 +1005,7 @@ impl ReviewPanel {
             // Inline comments for this file
             if let Some(comments) = file_comments.get(path) {
                 for comment in comments {
-                    scrollable = scrollable.child(self.render_comment_card(comment, cx));
+                    scrollable = scrollable.child(CommentCard::new(comment.clone()));
                 }
             }
         }
@@ -1080,7 +1020,7 @@ impl ReviewPanel {
                 ),
             );
             for comment in &general_comments {
-                scrollable = scrollable.child(self.render_comment_card(comment, cx));
+                scrollable = scrollable.child(CommentCard::new(comment.clone()));
             }
         }
 
@@ -1098,7 +1038,6 @@ impl ReviewPanel {
         v_flex()
             .id("review-thread")
             .size_full()
-            .on_action(cx.listener(Self::open_local_file))
             // PR header (fixed top)
             .child(
                 h_flex()
@@ -1113,11 +1052,11 @@ impl ReviewPanel {
                         IconButton::new("back-to-pr-list", IconName::ArrowLeft)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Back to PR list"))
-                            .on_click(cx.listener(|this, _, _window, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.selected_pr = None;
                                 this.pr_comments.clear();
                                 this.pr_api_files.clear();
-                                this.set_active_view(ActiveView::PullRequestList, cx);
+                                this.show_pull_request_list(window, cx);
                             })),
                     )
                     .child(
@@ -1170,524 +1109,12 @@ impl ReviewPanel {
             .into_any_element()
     }
 
-    fn render_comment_card(
-        &mut self,
-        comment: &ReviewComment,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let is_reply = comment.reply_to.is_some();
 
-        let mut card = v_flex()
-            .mx_2()
-            .mb_1()
-            .p_2()
-            .gap_1()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().editor_background)
-            .when(is_reply, |el| {
-                el.ml_4()
-                    .border_l_2()
-                    .border_color(cx.theme().colors().border_focused)
-            })
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Label::new(comment.author.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Default),
-                    )
-                    .when_some(comment.line, |el, line| {
-                        el.child(
-                            Label::new(format!("L{}", line))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Accent),
-                        )
-                    })
-                    .child(
-                        Label::new(comment.created_at.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            );
-
-        // Diff hunk code snippet
-        if let Some(hunk) = &comment.diff_hunk {
-            card = card.child(
-                v_flex()
-                    .rounded_md()
-                    .bg(cx.theme().colors().surface_background)
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .overflow_x_hidden()
-                    .py_1()
-                    .children(hunk.lines().map(|line| {
-                        let (line_color, line_bg) = if line.starts_with('+') {
-                            (Color::Created, Some(cx.theme().status().created.alpha(0.1)))
-                        } else if line.starts_with('-') {
-                            (Color::Deleted, Some(cx.theme().status().deleted.alpha(0.1)))
-                        } else if line.starts_with("@@") {
-                            (Color::Muted, None)
-                        } else {
-                            (Color::Default, None)
-                        };
-                        let mut row = div().px_2().child(
-                            Label::new(line.to_string())
-                                .size(LabelSize::XSmall)
-                                .color(line_color),
-                        );
-                        if let Some(bg) = line_bg {
-                            row = row.bg(bg);
-                        }
-                        row
-                    })),
-            );
-        }
-
-        card = card.child(
-            Label::new(comment.body.clone())
-                .size(LabelSize::XSmall)
-                .color(Color::Default),
-        );
-
-        card.into_any_element()
-    }
-
-    fn render_api_file_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let header_text = format!(
-            "{} <- {}",
-            self.base_branch.as_ref().map(|s| s.as_ref()).unwrap_or("?"),
-            self.head_branch.as_ref().map(|s| s.as_ref()).unwrap_or("?"),
-        );
-
-        let files = &self.pr_api_files;
-        let file_count = files.len();
-        let added = files
-            .iter()
-            .filter(|f| matches!(f.status, FileChangeStatus::Added))
-            .count();
-        let modified = files
-            .iter()
-            .filter(|f| matches!(f.status, FileChangeStatus::Modified))
-            .count();
-        let deleted = files
-            .iter()
-            .filter(|f| matches!(f.status, FileChangeStatus::Deleted))
-            .count();
-
-        let summary = format!(
-            "{} changed files (+{} -{} ~{})",
-            file_count, added, deleted, modified
-        );
-
-        v_flex()
-            .id("review-api-file-list")
-            .size_full()
-            .overflow_scroll()
-            .child(
-                h_flex().px_2().py_1().child(
-                    Label::new(header_text)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-            )
-            .child(
-                h_flex()
-                    .px_2()
-                    .pb_1()
-                    .gap_1()
-                    .child(
-                        Label::new(summary)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new("(remote)")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Warning),
-                    ),
-            )
-            .children(self.pr_api_files.iter().map(|file| {
-                let (icon, color) = match &file.status {
-                    FileChangeStatus::Added => (IconName::Plus, Color::Created),
-                    FileChangeStatus::Modified => (IconName::Pencil, Color::Modified),
-                    FileChangeStatus::Deleted => (IconName::Dash, Color::Deleted),
-                    FileChangeStatus::Renamed { .. } => (IconName::ArrowRight, Color::Modified),
-                };
-
-                let additions = file.additions;
-                let deletions = file.deletions;
-
-                h_flex()
-                    .id(SharedString::from(format!("api_file_{}", file.path)))
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .rounded_md()
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .child(Icon::new(icon).size(IconSize::Small).color(color))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .overflow_x_hidden()
-                            .child(
-                                Label::new(file.path.to_string())
-                                    .size(LabelSize::Small)
-                                    .single_line(),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .when(additions > 0, |el| {
-                                        el.child(
-                                            Label::new(format!("+{}", additions))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Created),
-                                        )
-                                    })
-                                    .when(deletions > 0, |el| {
-                                        el.child(
-                                            Label::new(format!("-{}", deletions))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Deleted),
-                                        )
-                                    }),
-                            ),
-                    )
-            }))
-            .into_any_element()
-    }
-
-    fn render_file_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.tree_diff.is_none() {
-            if !self.pr_api_files.is_empty() {
-                return self.render_api_file_list(cx);
-            }
-            return v_flex()
-                .size_full()
-                .justify_center()
-                .items_center()
-                .child(Label::new("Loading...").color(Color::Muted))
-                .into_any_element();
-        }
-
-        let entries = self.sorted_entries();
-
-        let header_text = format!(
-            "{} <- {}",
-            self.base_branch.as_ref().map(|s| s.as_ref()).unwrap_or("?"),
-            self.head_branch.as_ref().map(|s| s.as_ref()).unwrap_or("?"),
-        );
-
-        let file_count = entries.len();
-        let added = entries
-            .iter()
-            .filter(|(_, s)| matches!(s, TreeDiffStatus::Added))
-            .count();
-        let modified = entries
-            .iter()
-            .filter(|(_, s)| matches!(s, TreeDiffStatus::Modified { .. }))
-            .count();
-        let deleted = entries
-            .iter()
-            .filter(|(_, s)| matches!(s, TreeDiffStatus::Deleted { .. }))
-            .count();
-        let viewed_count = self.viewed_files.len();
-
-        let summary = format!(
-            "{} changed files (+{} -{} ~{}) — {}/{} viewed",
-            file_count, added, deleted, modified, viewed_count, file_count
-        );
-
-        let info_color = cx.theme().status().info;
-        let selected_bg_alpha = 0.08;
-
-        v_flex()
-            .id("review-file-list")
-            .size_full()
-            .overflow_scroll()
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::select_previous))
-            .on_action(cx.listener(Self::confirm))
-            .on_action(cx.listener(Self::open_local_file))
-            .child(
-                h_flex().px_2().py_1().child(
-                    Label::new(header_text)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-            )
-            .child(
-                h_flex().px_2().pb_1().child(
-                    Label::new(summary)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-            )
-            .children(entries.into_iter().enumerate().map(|(ix, (path, status))| {
-                let (icon, color) = match &status {
-                    TreeDiffStatus::Added => (IconName::Plus, Color::Created),
-                    TreeDiffStatus::Modified { .. } => (IconName::Pencil, Color::Modified),
-                    TreeDiffStatus::Deleted { .. } => (IconName::Dash, Color::Deleted),
-                };
-
-                let is_selected = self.selected_entry == Some(ix);
-                let is_viewed = self.viewed_files.contains(&path);
-                let label_color = if is_viewed {
-                    Color::Muted
-                } else {
-                    Color::Default
-                };
-
-                let bg = if is_selected {
-                    info_color.alpha(selected_bg_alpha)
-                } else {
-                    cx.theme().colors().ghost_element_background
-                };
-
-                let hover_bg = if is_selected {
-                    info_color.alpha(selected_bg_alpha + 0.04)
-                } else {
-                    cx.theme().colors().ghost_element_hover
-                };
-
-                h_flex()
-                    .id(SharedString::from(format!("file_entry_{}", ix)))
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .rounded_md()
-                    .bg(bg)
-                    .hover(move |style| style.bg(hover_bg))
-                    .when(!is_viewed, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .w(px(6.))
-                                .h(px(6.))
-                                .rounded_full()
-                                .bg(cx.theme().status().info),
-                        )
-                    })
-                    .when(is_viewed, |row| {
-                        row.child(div().flex_none().w(px(6.)).h(px(6.)))
-                    })
-                    .child(Icon::new(icon).size(IconSize::Small).color(color))
-                    .child(
-                        div().overflow_x_hidden().child(
-                            Label::new(path.as_std_path().to_string_lossy().to_string())
-                                .size(LabelSize::Small)
-                                .color(label_color)
-                                .single_line(),
-                        ),
-                    )
-                    .on_click({
-                        let path = path.clone();
-                        cx.listener(move |this, _event, window, cx| {
-                            this.open_file_diff(path.clone(), window, cx);
-                        })
-                    })
-            }))
-            .into_any_element()
-    }
-
-    fn render_pull_request_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.provider.is_none() {
-            return v_flex()
-                .size_full()
-                .justify_center()
-                .items_center()
-                .gap_2()
-                .child(Label::new("No GitHub remote detected").color(Color::Muted))
-                .child(
-                    Label::new("Push to a GitHub remote to see PRs")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .into_any_element();
-        }
-
-        if self.pr_list_loading && self.pull_requests.is_empty() {
-            return v_flex()
-                .size_full()
-                .justify_center()
-                .items_center()
-                .child(Label::new("Loading pull requests...").color(Color::Muted))
-                .into_any_element();
-        }
-
-        if self.pull_requests.is_empty() {
-            return v_flex()
-                .size_full()
-                .justify_center()
-                .items_center()
-                .child(Label::new("No pull requests found").color(Color::Muted))
-                .into_any_element();
-        }
-
-        let query = self
-            .pr_search_editor
-            .read(cx)
-            .text(cx)
-            .to_string()
-            .to_lowercase();
-
-        let filtered: Vec<_> = self
-            .pull_requests
-            .iter()
-            .filter(|pr| {
-                if query.is_empty() {
-                    return true;
-                }
-                let query_trimmed = query.trim_start_matches('#');
-                pr.number.to_string().contains(query_trimmed)
-                    || pr.author.to_lowercase().contains(&query)
-                    || pr.title.to_lowercase().contains(&query)
-            })
-            .cloned()
-            .collect();
-
-        let filter_label = match &self.pr_filter {
-            PullRequestState::Open => "Open",
-            PullRequestState::Closed => "Closed",
-            PullRequestState::Merged => "Merged",
-            PullRequestState::All => "All",
-        };
-        let weak_panel = cx.weak_entity();
-
-        v_flex()
-            .id("review-pr-list")
-            .size_full()
-            .overflow_scroll()
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
-                    .items_center()
-                    .child(div().flex_1().child(self.pr_search_editor.clone()))
-                    .child(
-                        PopoverMenu::new("pr-filter-menu")
-                            .trigger(
-                                IconButton::new("pr-filter-trigger", IconName::Filter)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text(format!("Filter: {}", filter_label))),
-                            )
-                            .anchor(Corner::TopRight)
-                            .with_handle(self.pr_filter_menu_handle.clone())
-                            .menu({
-                                let weak_panel = weak_panel.clone();
-                                move |window, cx| {
-                                    let weak_panel = weak_panel.clone();
-                                    Some(ContextMenu::build(
-                                        window,
-                                        cx,
-                                        move |menu, _window, _cx| {
-                                            menu.entry("Open", None, {
-                                                let weak_panel = weak_panel.clone();
-                                                move |_window, cx| {
-                                                    weak_panel
-                                                        .update(cx, |this, cx| {
-                                                            this.set_pr_filter(
-                                                                PullRequestState::Open,
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                }
-                                            })
-                                            .entry("Closed", None, {
-                                                let weak_panel = weak_panel.clone();
-                                                move |_window, cx| {
-                                                    weak_panel
-                                                        .update(cx, |this, cx| {
-                                                            this.set_pr_filter(
-                                                                PullRequestState::Closed,
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                }
-                                            })
-                                            .entry(
-                                                "All",
-                                                None,
-                                                {
-                                                    let weak_panel = weak_panel.clone();
-                                                    move |_window, cx| {
-                                                        weak_panel
-                                                            .update(cx, |this, cx| {
-                                                                this.set_pr_filter(
-                                                                    PullRequestState::All,
-                                                                    cx,
-                                                                );
-                                                            })
-                                                            .ok();
-                                                    }
-                                                },
-                                            )
-                                        },
-                                    ))
-                                }
-                            }),
-                    ),
-            )
-            .child(
-                h_flex().px_2().pb_1().child(
-                    Label::new(format!("{} {} pull requests", filtered.len(), filter_label))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-            )
-            .children(filtered.into_iter().map(|pr| {
-                let number = pr.number;
-                let title = pr.title.clone();
-                let author = pr.author.clone();
-                let updated = pr.updated_at.clone();
-
-                h_flex()
-                    .id(SharedString::from(format!("pr_{}", number)))
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .rounded_md()
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .child(
-                        Label::new(format!("#{}", number))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        v_flex()
-                            .overflow_x_hidden()
-                            .child(
-                                Label::new(title.to_string())
-                                    .size(LabelSize::Small)
-                                    .single_line(),
-                            )
-                            .child(
-                                Label::new(format!("by {} · {}", author, updated))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .single_line(),
-                            ),
-                    )
-                    .on_click({
-                        let pr = pr.clone();
-                        cx.listener(move |this, _event, _window, cx| {
-                            this.select_pull_request(&pr, cx);
-                        })
-                    })
-            }))
-            .into_any_element()
-    }
 }
 
 impl Render for ReviewPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.flush_pending_file_action(window, cx);
         v_flex()
             .id("review_panel")
             .track_focus(&self.focus_handle)
@@ -1701,9 +1128,33 @@ impl Render for ReviewPanel {
                         .items_center()
                         .child(Label::new("No review selected").color(Color::Muted)),
                 ),
-                ActiveView::PullRequestList => parent.child(self.render_pull_request_list(cx)),
+                ActiveView::PullRequestList => {
+                    if let Some((pr_list, _)) = &self.pull_request_list {
+                        parent.child(pr_list.clone())
+                    } else {
+                        parent.child(
+                            v_flex()
+                                .size_full()
+                                .justify_center()
+                                .items_center()
+                                .child(Label::new("Loading...").color(Color::Muted)),
+                        )
+                    }
+                }
                 ActiveView::ReviewThread => parent.child(self.render_review_thread(cx)),
-                ActiveView::FileList => parent.child(self.render_file_list(cx)),
+                ActiveView::FileList => {
+                    if let Some((file_list, _)) = &self.file_list {
+                        parent.child(file_list.clone())
+                    } else {
+                        parent.child(
+                            v_flex()
+                                .size_full()
+                                .justify_center()
+                                .items_center()
+                                .child(Label::new("Loading...").color(Color::Muted)),
+                        )
+                    }
+                }
                 ActiveView::Configuration => parent.child(
                     v_flex()
                         .size_full()
