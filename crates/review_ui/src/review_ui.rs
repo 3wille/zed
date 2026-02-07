@@ -6,6 +6,7 @@ mod pull_request_list;
 mod review_panel;
 mod review_panel_settings;
 mod review_provider;
+mod review_view;
 
 pub use review_panel::ReviewPanel;
 
