@@ -4,7 +4,7 @@ use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use crate::github_token::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
-use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewProvider};
+use crate::review_provider::{PullRequestInfo, ReviewProvider};
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
 use fs::Fs;
@@ -245,6 +245,25 @@ impl ReviewPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let weak_panel = cx.weak_entity();
+        let show_tree_toggle = matches!(
+            self.active_view,
+            ActiveView::FileList | ActiveView::ReviewThread
+        );
+        let is_tree_view = match &self.active_view {
+            ActiveView::FileList => self
+                .file_list
+                .as_ref()
+                .map(|(fl, _)| fl.read(cx).is_tree_view())
+                .unwrap_or(false),
+            ActiveView::ReviewThread => self
+                .review_view
+                .as_ref()
+                .map(|(rv, _)| rv.read(cx).is_tree_view())
+                .unwrap_or(false),
+            _ => false,
+        };
+        let is_review_thread = matches!(self.active_view, ActiveView::ReviewThread);
+
         PopoverMenu::new("review-options-menu")
             .trigger_with_tooltip(
                 IconButton::new("review-options-menu", IconName::EllipsisVertical)
@@ -256,7 +275,39 @@ impl ReviewPanel {
             .menu(move |window, cx| {
                 let weak_panel = weak_panel.clone();
                 Some(ContextMenu::build(window, cx, move |menu, _window, _| {
-                    menu.entry("Configuration", None, |_window, _cx| {
+                    menu.when(show_tree_toggle, |menu| {
+                        let weak_panel = weak_panel.clone();
+                        menu.entry(
+                            if is_tree_view {
+                                "Flat View"
+                            } else {
+                                "Tree View"
+                            },
+                            None,
+                            {
+                                let weak_panel = weak_panel.clone();
+                                move |window, cx| {
+                                    weak_panel
+                                        .update(cx, |this, cx| {
+                                            if is_review_thread {
+                                                if let Some((review_view, _)) = &this.review_view {
+                                                    review_view.update(cx, |rv, cx| {
+                                                        rv.toggle_tree_view(cx);
+                                                    });
+                                                }
+                                            } else if let Some((file_list, _)) = &this.file_list {
+                                                file_list.update(cx, |fl, cx| {
+                                                    fl.toggle_tree_view(window, cx);
+                                                });
+                                            }
+                                        })
+                                        .ok();
+                                }
+                            },
+                        )
+                        .separator()
+                    })
+                    .entry("Configuration", None, |_window, _cx| {
                         // TODO: dispatch OpenConfiguration action
                     })
                     .separator()
@@ -524,7 +575,9 @@ impl ReviewPanel {
                     });
                 }
 
-                this.show_file_list(cx);
+                if !matches!(this.active_view, ActiveView::ReviewThread) && file_count > 0 {
+                    this.show_file_list(cx);
+                }
             })?;
             anyhow::Ok(())
         })

@@ -1,12 +1,13 @@
 use crate::comment_card::CommentCard;
+use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
     FileChangeStatus, PullRequestFile, PullRequestInfo, ReviewComment, ReviewProvider, ReviewStatus,
 };
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use editor::Editor;
 use git::repository::RepoPath;
 use git::status::{TreeDiff, TreeDiffStatus};
-use gpui::{Context, Corner, Entity, EventEmitter, Focusable, Render, SharedString, Window};
+use gpui::{Context, Corner, Entity, EventEmitter, Focusable, Render, SharedString, Window, px};
 use std::sync::Arc;
 use ui::{
     ButtonLike, ButtonSize, Color, ContextMenu, ElevationIndex, Icon, IconButton, IconName,
@@ -18,6 +19,8 @@ pub enum ReviewViewEvent {
     OpenFileDiff(RepoPath),
     Back,
 }
+
+const TREE_INDENT: f32 = 16.0;
 
 pub struct ReviewView {
     provider: Option<Arc<dyn ReviewProvider>>,
@@ -32,6 +35,10 @@ pub struct ReviewView {
     comment_submitting: bool,
     review_action: ReviewStatus,
     review_action_menu_handle: PopoverMenuHandle<ContextMenu>,
+    view_mode: ViewMode,
+    expanded_dirs: HashSet<SharedString>,
+    display_entries: Vec<DisplayEntry>,
+    expanded_comment_files: HashSet<SharedString>,
 }
 
 impl EventEmitter<ReviewViewEvent> for ReviewView {}
@@ -69,6 +76,10 @@ impl ReviewView {
             comment_submitting: false,
             review_action: ReviewStatus::Commented,
             review_action_menu_handle: PopoverMenuHandle::default(),
+            view_mode: ViewMode::Flat,
+            expanded_dirs: HashSet::default(),
+            display_entries: Vec::new(),
+            expanded_comment_files: HashSet::default(),
         };
         this.load_pr_comments(pr_number, cx);
         this.load_pr_api_files(pr_number, cx);
@@ -79,7 +90,85 @@ impl ReviewView {
         self.tree_diff = tree_diff.map(|td| TreeDiff {
             entries: td.entries.clone(),
         });
+        self.rebuild_display_entries();
         cx.notify();
+    }
+
+    pub fn is_tree_view(&self) -> bool {
+        self.view_mode == ViewMode::Tree
+    }
+
+    pub fn toggle_tree_view(&mut self, cx: &mut Context<Self>) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Flat => ViewMode::Tree,
+            ViewMode::Tree => ViewMode::Flat,
+        };
+        self.rebuild_display_entries();
+        cx.notify();
+    }
+
+    fn rebuild_display_entries(&mut self) {
+        self.display_entries.clear();
+
+        let file_entries = self.collect_file_entries();
+
+        match self.view_mode {
+            ViewMode::Flat => {
+                for (ix, (path, _, _, _)) in file_entries.iter().enumerate() {
+                    self.display_entries.push(DisplayEntry::File {
+                        entry_index: ix,
+                        depth: 0,
+                        display_name: path.clone(),
+                    });
+                }
+            }
+            ViewMode::Tree => {
+                let paths: Vec<(usize, &str)> = file_entries
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, (path, _, _, _))| (ix, path.as_ref()))
+                    .collect();
+                let tree = build_file_tree(&paths);
+                flatten_file_tree(&tree, 0, &self.expanded_dirs, &mut self.display_entries);
+            }
+        }
+    }
+
+    fn collect_file_entries(&self) -> Vec<(SharedString, Option<FileChangeStatus>, u32, u32)> {
+        if !self.pr_api_files.is_empty() {
+            self.pr_api_files
+                .iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        Some(f.status.clone()),
+                        f.additions,
+                        f.deletions,
+                    )
+                })
+                .collect()
+        } else if let Some(tree_diff) = &self.tree_diff {
+            let mut entries: Vec<_> = tree_diff.entries.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            entries
+                .into_iter()
+                .map(|(path, status)| {
+                    let file_status = match status {
+                        TreeDiffStatus::Added => Some(FileChangeStatus::Added),
+                        TreeDiffStatus::Modified { .. } => Some(FileChangeStatus::Modified),
+                        TreeDiffStatus::Deleted { .. } => Some(FileChangeStatus::Deleted),
+                    };
+                    (
+                        SharedString::from(path.as_std_path().to_string_lossy().to_string()),
+                        file_status,
+                        0,
+                        0,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn load_pr_comments(&mut self, pr_number: u32, cx: &mut Context<Self>) {
@@ -125,6 +214,7 @@ impl ReviewView {
                 .await?;
             this.update(cx, |this, cx| {
                 this.pr_api_files = files;
+                this.rebuild_display_entries();
                 cx.notify();
             })?;
             anyhow::Ok(())
@@ -312,7 +402,8 @@ impl Render for ReviewView {
         let pr_number = self.selected_pr.number;
         let pr_title = self.selected_pr.title.clone();
         let pr_author = self.selected_pr.author.clone();
-        let file_count = self.pr_api_files.len();
+        let file_entries = self.collect_file_entries();
+        let file_count = file_entries.len();
 
         let mut file_comments: HashMap<SharedString, Vec<ReviewComment>> = HashMap::default();
         let mut general_comments: Vec<ReviewComment> = Vec::new();
@@ -327,106 +418,194 @@ impl Render for ReviewView {
             }
         }
 
-        let file_entries: Vec<(SharedString, Option<FileChangeStatus>, u32, u32)> =
-            if !self.pr_api_files.is_empty() {
-                self.pr_api_files
-                    .iter()
-                    .map(|f| {
-                        (
-                            f.path.clone(),
-                            Some(f.status.clone()),
-                            f.additions,
-                            f.deletions,
-                        )
-                    })
-                    .collect()
-            } else if let Some(tree_diff) = &self.tree_diff {
-                let mut entries: Vec<_> = tree_diff.entries.iter().collect();
-                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-                entries
-                    .into_iter()
-                    .map(|(path, status)| {
-                        let file_status = match status {
-                            TreeDiffStatus::Added => Some(FileChangeStatus::Added),
-                            TreeDiffStatus::Modified { .. } => Some(FileChangeStatus::Modified),
-                            TreeDiffStatus::Deleted { .. } => Some(FileChangeStatus::Deleted),
-                        };
-                        (
-                            SharedString::from(path.as_std_path().to_string_lossy().to_string()),
-                            file_status,
-                            0,
-                            0,
-                        )
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
         let mut scrollable = v_flex()
             .id("review-scrollable")
             .flex_1()
             .overflow_scroll()
             .gap_1();
 
-        for (path, status, additions, deletions) in &file_entries {
-            let (icon, color) = match status {
-                Some(FileChangeStatus::Added) => (IconName::Plus, Color::Created),
-                Some(FileChangeStatus::Modified) => (IconName::Pencil, Color::Modified),
-                Some(FileChangeStatus::Deleted) => (IconName::Dash, Color::Deleted),
-                Some(FileChangeStatus::Renamed { .. }) => (IconName::ArrowRight, Color::Modified),
-                None => (IconName::File, Color::Muted),
-            };
+        for (ix, entry) in self.display_entries.iter().enumerate() {
+            match entry {
+                DisplayEntry::Directory {
+                    path,
+                    name,
+                    depth,
+                    expanded,
+                } => {
+                    let folder_icon = if *expanded {
+                        IconName::FolderOpen
+                    } else {
+                        IconName::Folder
+                    };
+                    let dir_path = path.clone();
+                    let was_expanded = *expanded;
 
-            let repo_path = RepoPath::new(path.as_ref()).ok();
-            let file_row = h_flex()
-                .id(SharedString::from(format!("pr_file_{}", path)))
-                .px_2()
-                .py_1()
-                .gap_2()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                .child(Icon::new(icon).size(IconSize::Small).color(color))
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .overflow_x_hidden()
+                    scrollable = scrollable.child(
+                        h_flex()
+                            .id(SharedString::from(format!("rv_dir_{}", ix)))
+                            .px_2()
+                            .py_1()
+                            .gap_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                            .pl(px(*depth as f32 * TREE_INDENT + 8.0))
+                            .child(
+                                Icon::new(folder_icon)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div().overflow_x_hidden().child(
+                                    Label::new(name.to_string())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .single_line(),
+                                ),
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                if was_expanded {
+                                    this.expanded_dirs.remove(&dir_path);
+                                } else {
+                                    this.expanded_dirs.insert(dir_path.clone());
+                                }
+                                this.rebuild_display_entries();
+                                cx.notify();
+                            })),
+                    );
+                }
+                DisplayEntry::File {
+                    entry_index,
+                    depth,
+                    display_name,
+                } => {
+                    let Some((path, status, additions, deletions)) =
+                        file_entries.get(*entry_index)
+                    else {
+                        continue;
+                    };
+
+                    let (icon, color) = match status {
+                        Some(FileChangeStatus::Added) => (IconName::Plus, Color::Created),
+                        Some(FileChangeStatus::Modified) => (IconName::Pencil, Color::Modified),
+                        Some(FileChangeStatus::Deleted) => (IconName::Dash, Color::Deleted),
+                        Some(FileChangeStatus::Renamed { .. }) => {
+                            (IconName::ArrowRight, Color::Modified)
+                        }
+                        None => (IconName::File, Color::Muted),
+                    };
+
+                    let indent = *depth as f32 * TREE_INDENT + 8.0;
+                    let repo_path = RepoPath::new(path.as_ref()).ok();
+                    let comment_count = file_comments
+                        .get(path)
+                        .map(|c| c.len())
+                        .unwrap_or(0);
+                    let comments_expanded =
+                        self.expanded_comment_files.contains(path);
+                    let path_for_toggle = path.clone();
+
+                    let file_row = h_flex()
+                        .id(SharedString::from(format!("pr_file_{}", ix)))
+                        .px_2()
+                        .py_1()
                         .gap_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                        .pl(px(indent))
+                        .child(Icon::new(icon).size(IconSize::Small).color(color))
                         .child(
-                            Label::new(path.to_string())
-                                .size(LabelSize::Small)
-                                .single_line(),
+                            h_flex()
+                                .flex_1()
+                                .overflow_x_hidden()
+                                .gap_2()
+                                .child(
+                                    Label::new(display_name.to_string())
+                                        .size(LabelSize::Small)
+                                        .single_line(),
+                                )
+                                .when(*additions > 0, |el| {
+                                    el.child(
+                                        Label::new(format!("+{}", additions))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Created),
+                                    )
+                                })
+                                .when(*deletions > 0, |el| {
+                                    el.child(
+                                        Label::new(format!("-{}", deletions))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Deleted),
+                                    )
+                                }),
                         )
-                        .when(*additions > 0, |el| {
-                            el.child(
-                                Label::new(format!("+{}", additions))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Created),
+                        .when(comment_count > 0, |row| {
+                            let chevron = if comments_expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            };
+                            row.child(
+                                h_flex()
+                                    .id(SharedString::from(format!("comment_badge_{}", ix)))
+                                    .flex_none()
+                                    .gap_1()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                    .child(
+                                        Icon::new(IconName::Chat)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(comment_count.to_string())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Icon::new(chevron)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            if this
+                                                .expanded_comment_files
+                                                .contains(&path_for_toggle)
+                                            {
+                                                this.expanded_comment_files
+                                                    .remove(&path_for_toggle);
+                                            } else {
+                                                this.expanded_comment_files
+                                                    .insert(path_for_toggle.clone());
+                                            }
+                                            cx.notify();
+                                        },
+                                    )),
                             )
-                        })
-                        .when(*deletions > 0, |el| {
-                            el.child(
-                                Label::new(format!("-{}", deletions))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Deleted),
-                            )
-                        }),
-                );
+                        });
 
-            let file_row = if let Some(repo_path) = repo_path {
-                file_row.on_click(cx.listener(move |_this, _event, _window, cx| {
-                    cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
-                }))
-            } else {
-                file_row
-            };
+                    let file_row = if let Some(repo_path) = repo_path {
+                        file_row.on_click(cx.listener(move |_this, _event, _window, cx| {
+                            cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
+                        }))
+                    } else {
+                        file_row
+                    };
 
-            scrollable = scrollable.child(file_row);
+                    scrollable = scrollable.child(file_row);
 
-            if let Some(comments) = file_comments.get(path) {
-                for comment in comments {
-                    scrollable = scrollable.child(CommentCard::new(comment.clone()));
+                    if comments_expanded {
+                        if let Some(comments) = file_comments.get(path) {
+                            for comment in comments {
+                                scrollable =
+                                    scrollable.child(CommentCard::new(comment.clone()));
+                            }
+                        }
+                    }
                 }
             }
         }
