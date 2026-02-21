@@ -2,6 +2,7 @@ mod comment_card;
 mod file_list;
 mod github_provider;
 mod github_token;
+mod inline_comment;
 mod pull_request_list;
 mod review_panel;
 mod review_panel_settings;

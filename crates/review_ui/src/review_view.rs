@@ -171,6 +171,38 @@ impl ReviewView {
         }
     }
 
+    pub fn pr_comments(&self) -> &[ReviewComment] {
+        &self.pr_comments
+    }
+
+    pub fn comments_for_file(&self, path: &SharedString) -> Vec<ReviewComment> {
+        let mut parent_comments: Vec<ReviewComment> = Vec::new();
+        let mut replies: Vec<ReviewComment> = Vec::new();
+
+        for comment in &self.pr_comments {
+            if comment.path.as_ref() == Some(path) {
+                if comment.reply_to.is_some() {
+                    replies.push(comment.clone());
+                } else {
+                    parent_comments.push(comment.clone());
+                }
+            }
+        }
+
+        let mut result = Vec::new();
+        for parent in parent_comments {
+            let parent_id = parent.id;
+            result.push(parent);
+            for reply in &replies {
+                if reply.reply_to == Some(parent_id) {
+                    result.push(reply.clone());
+                }
+            }
+        }
+
+        result
+    }
+
     fn load_pr_comments(&mut self, pr_number: u32, cx: &mut Context<Self>) {
         let Some(provider) = self.provider.clone() else {
             return;
@@ -600,9 +632,73 @@ impl Render for ReviewView {
 
                     if comments_expanded {
                         if let Some(comments) = file_comments.get(path) {
-                            for comment in comments {
-                                scrollable =
-                                    scrollable.child(CommentCard::new(comment.clone()));
+                            for (comment_ix, comment) in comments.iter().enumerate() {
+                                let is_reply = comment.reply_to.is_some();
+                                let line_label = comment
+                                    .line
+                                    .map(|l| format!("at {} ", l))
+                                    .unwrap_or_default();
+                                let body_preview: String = comment
+                                    .body
+                                    .chars()
+                                    .take(60)
+                                    .collect::<String>()
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string();
+                                let comment_repo_path =
+                                    RepoPath::new(path.as_ref()).ok();
+
+                                let row = h_flex()
+                                    .id(SharedString::from(format!(
+                                        "compact_comment_{}_{}", ix, comment_ix
+                                    )))
+                                    .px_2()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .pl(px(indent + 16.0))
+                                    .when(is_reply, |el| el.pl(px(indent + 32.0)))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style.bg(cx.theme().colors().ghost_element_hover)
+                                    })
+                                    .when(!line_label.is_empty(), |el| {
+                                        el.child(
+                                            Label::new(line_label)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                        )
+                                    })
+                                    .child(
+                                        Label::new(format!("@{}", comment.author))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Default),
+                                    )
+                                    .child(
+                                        div().overflow_x_hidden().flex_1().child(
+                                            Label::new(body_preview)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .single_line(),
+                                        ),
+                                    );
+
+                                let row = if let Some(ref repo_path) = comment_repo_path {
+                                    let repo_path = repo_path.clone();
+                                    row.on_click(cx.listener(
+                                        move |_this, _event, _window, cx| {
+                                            cx.emit(ReviewViewEvent::OpenFileDiff(
+                                                repo_path.clone(),
+                                            ));
+                                        },
+                                    ))
+                                } else {
+                                    row
+                                };
+
+                                scrollable = scrollable.child(row);
                             }
                         }
                     }

@@ -1,19 +1,26 @@
 use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
+use crate::inline_comment::{ApplySuggestion, parse_suggestions, render_pr_comment_block, SuggestionBlock};
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use crate::github_token::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
-use crate::review_provider::{PullRequestInfo, ReviewProvider};
+use crate::review_provider::{PullRequestInfo, ReviewComment, ReviewProvider};
+use markdown::Markdown;
 use anyhow::Result;
+use collections::HashMap;
 use credentials_provider::CredentialsProvider;
+use editor::Anchor;
+use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
+use editor::Editor;
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff};
 use gpui::{
-    App, AsyncWindowContext, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
-    Render, SharedString, Subscription, WeakEntity, Window,
+    App, AsyncWindowContext, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
 };
+use text::{Point, ToPoint as _};
 use http_client::HttpClient;
 use project::{
     Project,
@@ -79,11 +86,28 @@ pub struct ReviewPanel {
     selected_pr: Option<PullRequestInfo>,
     pr_ref_fetch_task: Option<gpui::Task<Result<()>>>,
     pending_action: Option<PendingAction>,
+    injected_comment_blocks: HashMap<EntityId, (WeakEntity<Editor>, Vec<CustomBlockId>)>,
+    _workspace_subscription: Option<Subscription>,
 }
 
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         workspace.toggle_panel_focus::<ReviewPanel>(window, cx);
+    });
+
+    workspace.register_action(|workspace, action: &ApplySuggestion, _window, cx| {
+        let comment_id = action.comment_id;
+        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+            return;
+        };
+
+        let active_editor = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx));
+
+        panel.update(cx, |panel, cx| {
+            panel.handle_apply_suggestion(comment_id, active_editor, cx);
+        });
     });
 }
 
@@ -121,6 +145,15 @@ impl ReviewPanel {
         )
         .detach();
 
+        let workspace_entity = weak_workspace.upgrade();
+        let workspace_subscription = workspace_entity.map(|ws| {
+            cx.subscribe(&ws, |this: &mut Self, workspace, event, cx| {
+                if let workspace::Event::ActiveItemChanged = event {
+                    this.on_active_item_changed(&workspace, cx);
+                }
+            })
+        });
+
         let mut this = Self {
             _workspace: weak_workspace,
             project,
@@ -145,6 +178,8 @@ impl ReviewPanel {
             selected_pr: None,
             pr_ref_fetch_task: None,
             pending_action: None,
+            injected_comment_blocks: HashMap::default(),
+            _workspace_subscription: workspace_subscription,
         };
         this.initialize_provider(cx);
         this.load_branches(cx);
@@ -414,6 +449,7 @@ impl ReviewPanel {
     }
 
     fn select_pull_request(&mut self, pr: &PullRequestInfo, cx: &mut Context<Self>) {
+        self.remove_all_injected_blocks(cx);
         self.selected_pr = Some(pr.clone());
         self.base_branch = Some(pr.base_ref.clone());
         self.head_branch = Some(pr.head_ref.clone());
@@ -448,6 +484,7 @@ impl ReviewPanel {
                     ReviewViewEvent::Back => {
                         this.selected_pr = None;
                         this.review_view = None;
+                        this.remove_all_injected_blocks(cx);
                         this.show_pull_request_list(window, cx);
                     }
                 }
@@ -649,6 +686,320 @@ impl ReviewPanel {
     fn open_local_file_by_path(&mut self, path: RepoPath, cx: &mut Context<Self>) {
         self.pending_action = Some(PendingAction::OpenLocal(path));
         cx.notify();
+    }
+
+    fn on_active_item_changed(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        if self.selected_pr.is_none() {
+            return;
+        }
+        let Some((review_view, _)) = &self.review_view else {
+            return;
+        };
+
+        let active_item = workspace.read(cx).active_item(cx);
+        let Some(item) = active_item else {
+            return;
+        };
+        let Some(editor) = item.act_as::<Editor>(cx) else {
+            return;
+        };
+
+        let editor_id = editor.entity_id();
+        if self.injected_comment_blocks.contains_key(&editor_id) {
+            return;
+        }
+
+        if let Some(project_path) = editor.read(cx).project_path(cx) {
+            let file_path = SharedString::from(
+                project_path
+                    .path
+                    .as_ref()
+                    .as_std_path()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            let comments = review_view.read(cx).comments_for_file(&file_path);
+            if !comments.is_empty() {
+                self.inject_pr_comments_into_editor(&editor, &comments, cx);
+            }
+            return;
+        }
+
+        self.inject_for_multibuffer_editor(&editor, &review_view.clone(), cx);
+    }
+
+    fn inject_for_multibuffer_editor(
+        &mut self,
+        editor: &Entity<Editor>,
+        review_view: &Entity<ReviewView>,
+        cx: &mut Context<Self>,
+    ) {
+        let multibuffer = editor.read(cx).buffer().clone();
+
+        // Collect path keys and comments, then create markdown entities outside the borrow
+        let paths_with_comments: Vec<_> = {
+            let mb_read = multibuffer.read(cx);
+            let rv_read = review_view.read(cx);
+
+            mb_read
+                .paths()
+                .filter_map(|path_key| {
+                    let file_path = SharedString::from(
+                        path_key.path.as_std_path().to_string_lossy().to_string(),
+                    );
+                    let comments = rv_read.comments_for_file(&file_path);
+                    if comments.is_empty() {
+                        return None;
+                    }
+                    let excerpt_ids: Vec<_> = mb_read.excerpts_for_path(path_key).collect();
+                    Some((excerpt_ids, comments))
+                })
+                .collect()
+        };
+
+        let paths_with_threads: Vec<_> = paths_with_comments
+            .into_iter()
+            .filter_map(|(excerpt_ids, comments)| {
+                let threads = Self::build_comment_threads(&comments, cx);
+                if threads.is_empty() {
+                    return None;
+                }
+                Some((excerpt_ids, threads))
+            })
+            .collect();
+
+        if paths_with_threads.is_empty() {
+            return;
+        }
+
+        let snapshot = multibuffer.read(cx).snapshot(cx);
+        let mut all_blocks: Vec<BlockProperties<Anchor>> = Vec::new();
+
+        for (excerpt_ids, threads) in &paths_with_threads {
+            for (excerpt_id, buffer_snapshot, excerpt_range) in snapshot.excerpts() {
+                if !excerpt_ids.contains(&excerpt_id) {
+                    continue;
+                }
+
+                let excerpt_start_row = excerpt_range.context.start.to_point(buffer_snapshot).row;
+                let excerpt_end_row = excerpt_range.context.end.to_point(buffer_snapshot).row;
+
+                for (line, thread_comments) in threads {
+                    let row = line.saturating_sub(1);
+                    if row < excerpt_start_row || row > excerpt_end_row {
+                        continue;
+                    }
+
+                    let point = text::Point::new(row, 0);
+                    let text_anchor = buffer_snapshot.anchor_before(point);
+                    let anchor = Anchor::in_buffer(excerpt_id, text_anchor);
+
+                    let height = Self::estimate_block_height(thread_comments);
+                    let thread_clone = thread_comments.clone();
+                    all_blocks.push(BlockProperties {
+                        placement: BlockPlacement::Below(anchor),
+                        height: Some(height),
+                        style: BlockStyle::Flex,
+                        render: Arc::new(move |cx| {
+                            render_pr_comment_block(thread_clone.clone(), cx)
+                        }),
+                        priority: 0,
+                    });
+                }
+            }
+        }
+
+        if all_blocks.is_empty() {
+            return;
+        }
+
+        let editor_id = editor.entity_id();
+        let block_ids = editor.update(cx, |editor, cx| {
+            editor.insert_blocks(all_blocks, None, cx)
+        });
+
+        self.injected_comment_blocks
+            .insert(editor_id, (editor.downgrade(), block_ids));
+    }
+
+    fn inject_pr_comments_into_editor(
+        &mut self,
+        editor: &Entity<Editor>,
+        comments: &[ReviewComment],
+        cx: &mut Context<Self>,
+    ) {
+        let threads = Self::build_comment_threads(comments, cx);
+        if threads.is_empty() {
+            return;
+        }
+
+        let editor_id = editor.entity_id();
+        let block_ids = editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let max_row = snapshot.max_point().row;
+
+            let blocks: Vec<_> = threads
+                .into_iter()
+                .filter_map(|(line, thread_comments)| {
+                    let row = line.saturating_sub(1);
+                    if row > max_row {
+                        return None;
+                    }
+                    let anchor = snapshot.anchor_before(Point::new(row, 0));
+                    let height = Self::estimate_block_height(&thread_comments);
+                    let thread_clone = thread_comments.clone();
+                    Some(BlockProperties {
+                        placement: BlockPlacement::Below(anchor),
+                        height: Some(height),
+                        style: BlockStyle::Flex,
+                        render: Arc::new(move |cx| {
+                            render_pr_comment_block(thread_clone.clone(), cx)
+                        }),
+                        priority: 0,
+                    })
+                })
+                .collect();
+
+            editor.insert_blocks(blocks, None, cx)
+        });
+
+        self.injected_comment_blocks
+            .insert(editor_id, (editor.downgrade(), block_ids));
+    }
+
+    fn remove_all_injected_blocks(&mut self, cx: &mut Context<Self>) {
+        let entries: Vec<_> = self.injected_comment_blocks.drain().collect();
+        for (_editor_id, (weak_editor, block_ids)) in entries {
+            if let Some(editor) = weak_editor.upgrade() {
+                let block_id_set = block_ids.into_iter().collect();
+                editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(block_id_set, None, cx);
+                });
+            }
+        }
+    }
+
+    fn build_comment_threads(
+        comments: &[ReviewComment],
+        cx: &mut App,
+    ) -> Vec<(u32, Vec<(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)>)> {
+        let mut threads: Vec<(
+            u32,
+            Vec<(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)>,
+        )> = Vec::new();
+
+        for comment in comments {
+            if comment.reply_to.is_none() {
+                if let Some(line) = comment.line {
+                    let (cleaned_body, suggestions) = parse_suggestions(&comment.body);
+                    let md = cx.new(|cx| {
+                        Markdown::new(SharedString::from(cleaned_body), None, None, cx)
+                    });
+                    threads.push((line, vec![(comment.clone(), md, suggestions)]));
+                }
+            }
+        }
+
+        for comment in comments {
+            if let Some(reply_to) = comment.reply_to {
+                for (_, thread) in &mut threads {
+                    if thread.first().map(|(c, _, _)| c.id) == Some(reply_to) {
+                        let (cleaned_body, suggestions) = parse_suggestions(&comment.body);
+                        let md = cx.new(|cx| {
+                            Markdown::new(SharedString::from(cleaned_body), None, None, cx)
+                        });
+                        thread.push((comment.clone(), md, suggestions));
+                        break;
+                    }
+                }
+            }
+        }
+
+        threads
+    }
+
+    fn estimate_block_height(
+        thread: &[(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)],
+    ) -> u32 {
+        let mut total: u32 = 0;
+        for (comment, _, suggestions) in thread {
+            let line_count = comment.body.lines().count().max(1) as u32;
+            total += 1 + line_count + 1;
+            for suggestion in suggestions {
+                let suggestion_lines = suggestion.suggested_code.lines().count().max(1) as u32;
+                total += 2 + suggestion_lines + 1;
+            }
+        }
+        total.max(3)
+    }
+
+    fn handle_apply_suggestion(
+        &mut self,
+        comment_id: u64,
+        active_editor: Option<Entity<Editor>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((review_view, _)) = &self.review_view else {
+            log::warn!("apply_suggestion: no review view");
+            return;
+        };
+
+        let comment = review_view
+            .read(cx)
+            .pr_comments()
+            .iter()
+            .find(|c| c.id == comment_id)
+            .cloned();
+
+        let Some(comment) = comment else {
+            log::warn!("apply_suggestion: comment {} not found", comment_id);
+            return;
+        };
+
+        let (_, suggestions) = parse_suggestions(&comment.body);
+        let Some(suggestion) = suggestions.into_iter().next() else {
+            log::warn!("apply_suggestion: no suggestion in comment {}", comment_id);
+            return;
+        };
+
+        let Some(line) = comment.line else {
+            log::warn!("apply_suggestion: comment {} has no line", comment_id);
+            return;
+        };
+
+        let Some(editor) = active_editor else {
+            log::warn!("apply_suggestion: no active editor");
+            return;
+        };
+
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let max_row = snapshot.max_point().row;
+            let row = line.saturating_sub(1);
+            if row > max_row {
+                log::warn!(
+                    "apply_suggestion: row {} exceeds buffer max {}",
+                    row,
+                    max_row
+                );
+                return;
+            }
+
+            let line_start = Point::new(row, 0);
+            let line_end = if row < max_row {
+                Point::new(row + 1, 0)
+            } else {
+                snapshot.max_point()
+            };
+
+            let replacement = if row < max_row {
+                format!("{}\n", suggestion.suggested_code)
+            } else {
+                suggestion.suggested_code.clone()
+            };
+
+            editor.edit([(line_start..line_end, replacement.as_str())], cx);
+        });
     }
 
     fn flush_pending_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
