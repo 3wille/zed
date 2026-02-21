@@ -35,3 +35,5 @@ http_client.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 git_hosting_providers.workspace = true
+markdown.workspace = true
+text.workspace = true

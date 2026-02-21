@@ -220,4 +220,21 @@ pub trait ReviewProvider: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<SharedString>>> + Send>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    fn apply_suggestion(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _number: u32,
+        _comment_id: u64,
+        _suggested_code: &str,
+        _path: &str,
+        _line: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        Box::pin(async {
+            Err(anyhow::anyhow!(
+                "apply suggestion not supported by this provider"
+            ))
+        })
+    }
 }
