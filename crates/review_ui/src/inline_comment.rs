@@ -3,8 +3,8 @@ use editor::display_map::BlockContext;
 use gpui::{AnyElement, Entity, SharedString};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use ui::{
-    Button, ButtonStyle, Color, FluentBuilder, Icon, IconName, IntoElement, Label, LabelSize,
-    h_flex, prelude::*, v_flex,
+    Button, ButtonLike, ButtonStyle, Color, FluentBuilder, Icon, IconName, IconSize, IntoElement,
+    Label, LabelSize, Tooltip, h_flex, prelude::*, v_flex,
 };
 
 #[derive(Clone, Debug)]
@@ -48,23 +48,63 @@ pub fn parse_suggestions(body: &str) -> (String, Vec<SuggestionBlock>) {
 /// Each tuple pairs a comment with its pre-created Markdown entity and extracted suggestions.
 pub fn render_pr_comment_block(
     comments: Vec<(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)>,
+    collapsed: bool,
     cx: &mut BlockContext,
 ) -> AnyElement {
     let colors = cx.theme().colors().clone();
     let style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+    let thread_id = comments.first().map(|(comment, _, _)| comment.id);
+    let comment_count = comments.len();
 
-    let mut container = v_flex()
+    let mut comment_body = v_flex().w_full().overflow_x_hidden().gap_1();
+
+    if collapsed {
+        comment_body = comment_body.child(
+            Label::new(format!("{comment_count} review comment(s)"))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        );
+    }
+
+    let container = h_flex()
         .w_full()
         .max_w(cx.max_width - cx.anchor_x)
+        .items_start()
         .overflow_x_hidden()
-        .pl(cx.anchor_x)
         .pr_2()
         .py_1()
         .gap_1()
         .border_t_1()
         .border_b_1()
         .border_color(colors.border)
-        .bg(colors.editor_background);
+        .bg(colors.editor_background)
+        .child(h_flex().w(cx.anchor_x).justify_end().pr_1().when_some(
+            thread_id,
+            |this, comment_id| {
+                this.child(
+                    ButtonLike::new(SharedString::from(format!(
+                        "toggle_review_comment_{comment_id}"
+                    )))
+                    .child(
+                        Icon::new(IconName::ChevronUp)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(if collapsed {
+                        "Show review comments"
+                    } else {
+                        "Hide review comments"
+                    }))
+                    .on_click(move |_event, window, cx| {
+                        window.dispatch_action(Box::new(ToggleCommentThread { comment_id }), cx);
+                    }),
+                )
+            },
+        ));
+
+    if collapsed {
+        return container.child(comment_body).into_any_element();
+    }
 
     for (comment, markdown_entity, suggestions) in &comments {
         let is_reply = comment.reply_to.is_some();
@@ -101,10 +141,10 @@ pub fn render_pr_comment_block(
             row = row.child(render_suggestion_block(suggestion, comment.id, cx));
         }
 
-        container = container.child(row);
+        comment_body = comment_body.child(row);
     }
 
-    container.into_any_element()
+    container.child(comment_body).into_any_element()
 }
 
 fn render_suggestion_block(
@@ -165,5 +205,10 @@ fn render_suggestion_block(
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
 pub struct ApplySuggestion {
+    pub comment_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+pub struct ToggleCommentThread {
     pub comment_id: u64,
 }
