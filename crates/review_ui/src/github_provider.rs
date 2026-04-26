@@ -21,6 +21,7 @@ struct GhPullRequest {
     head: GhRef,
     created_at: String,
     updated_at: String,
+    merged_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +101,31 @@ async fn github_get<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).context("failed to parse GitHub response")
 }
 
+async fn github_get_paginated<T: serde::de::DeserializeOwned>(
+    http_client: &Arc<dyn HttpClient>,
+    token: &Option<String>,
+    url: &str,
+) -> anyhow::Result<Vec<T>> {
+    let mut page = 1;
+    let mut results = Vec::new();
+
+    loop {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let page_url = format!("{url}{separator}per_page=100&page={page}");
+        let mut items: Vec<T> = github_get(http_client, token, &page_url).await?;
+        let is_last_page = items.len() < 100;
+        results.append(&mut items);
+
+        if is_last_page {
+            break;
+        }
+
+        page += 1;
+    }
+
+    Ok(results)
+}
+
 async fn github_post<T: serde::de::DeserializeOwned>(
     http_client: &Arc<dyn HttpClient>,
     token: &Option<String>,
@@ -129,9 +155,10 @@ async fn github_post<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).context("failed to parse GitHub response")
 }
 
-fn map_pr_state(state: &str) -> PullRequestState {
+fn map_pr_state(state: &str, merged_at: Option<&str>) -> PullRequestState {
     match state {
         "open" => PullRequestState::Open,
+        "closed" if merged_at.is_some() => PullRequestState::Merged,
         "closed" => PullRequestState::Closed,
         _ => PullRequestState::Closed,
     }
@@ -155,7 +182,7 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         title: pr.title.into(),
         author: pr.user.login.into(),
         description: pr.body.unwrap_or_default().into(),
-        state: map_pr_state(&pr.state),
+        state: map_pr_state(&pr.state, pr.merged_at.as_deref()),
         base_ref: pr.base.ref_name.into(),
         head_ref: pr.head.ref_name.into(),
         base_sha: pr.base.sha.into(),
@@ -164,6 +191,32 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         updated_at: pr.updated_at.into(),
         review_status: ReviewStatus::Pending,
     }
+}
+
+fn map_review_state(state: &str) -> Option<ReviewStatus> {
+    match state {
+        "APPROVED" => Some(ReviewStatus::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewStatus::ChangesRequested),
+        "COMMENTED" => Some(ReviewStatus::Commented),
+        _ => None,
+    }
+}
+
+async fn fetch_review_status(
+    http_client: &Arc<dyn HttpClient>,
+    token: &Option<String>,
+    owner: &str,
+    repo: &str,
+    number: u32,
+) -> anyhow::Result<ReviewStatus> {
+    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/reviews");
+    let reviews: Vec<GhReview> = github_get_paginated(http_client, token, &url).await?;
+
+    Ok(reviews
+        .iter()
+        .rev()
+        .find_map(|review| map_review_state(&review.state))
+        .unwrap_or(ReviewStatus::Pending))
 }
 
 fn map_file(file: GhFile) -> PullRequestFile {
@@ -215,14 +268,38 @@ impl ReviewProvider for GitHubProvider {
             PullRequestState::Closed | PullRequestState::Merged => "closed",
             PullRequestState::All => "all",
         };
-        let url =
-            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls?state={state_param}&per_page=30");
+        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls?state={state_param}");
         let http_client = self.http_client.clone();
         let token = self.token.clone();
+        let owner = owner.to_string();
+        let repo = repo.to_string();
 
         Box::pin(async move {
-            let gh_prs: Vec<GhPullRequest> = github_get(&http_client, &token, &url).await?;
-            Ok(gh_prs.into_iter().map(map_pull_request).collect())
+            let gh_prs: Vec<GhPullRequest> =
+                github_get_paginated(&http_client, &token, &url).await?;
+            let mut pull_requests = Vec::with_capacity(gh_prs.len());
+
+            for gh_pr in gh_prs {
+                let mut pull_request = map_pull_request(gh_pr);
+                if matches!(state, PullRequestState::Merged)
+                    && !matches!(pull_request.state, PullRequestState::Merged)
+                {
+                    continue;
+                }
+                if matches!(state, PullRequestState::Closed)
+                    && matches!(pull_request.state, PullRequestState::Merged)
+                {
+                    continue;
+                }
+
+                pull_request.review_status =
+                    fetch_review_status(&http_client, &token, &owner, &repo, pull_request.number)
+                        .await
+                        .unwrap_or(ReviewStatus::Pending);
+                pull_requests.push(pull_request);
+            }
+
+            Ok(pull_requests)
         })
     }
 
@@ -233,17 +310,24 @@ impl ReviewProvider for GitHubProvider {
         number: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestDetails>> + Send>> {
         let pr_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}");
-        let files_url =
-            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100");
+        let files_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/files");
         let http_client = self.http_client.clone();
         let token = self.token.clone();
+        let owner = owner.to_string();
+        let repo = repo.to_string();
 
         Box::pin(async move {
             let gh_pr: GhPullRequest = github_get(&http_client, &token, &pr_url).await?;
-            let gh_files: Vec<GhFile> = github_get(&http_client, &token, &files_url).await?;
+            let gh_files: Vec<GhFile> =
+                github_get_paginated(&http_client, &token, &files_url).await?;
+            let review_status = fetch_review_status(&http_client, &token, &owner, &repo, number)
+                .await
+                .unwrap_or(ReviewStatus::Pending);
+            let mut info = map_pull_request(gh_pr);
+            info.review_status = review_status;
 
             Ok(PullRequestDetails {
-                info: map_pull_request(gh_pr),
+                info,
                 files: gh_files.into_iter().map(map_file).collect(),
                 comments: Vec::new(),
                 checks: Vec::new(),
@@ -259,13 +343,12 @@ impl ReviewProvider for GitHubProvider {
         repo: &str,
         number: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<PullRequestFile>>> + Send>> {
-        let url =
-            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100");
+        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/files");
         let http_client = self.http_client.clone();
         let token = self.token.clone();
 
         Box::pin(async move {
-            let gh_files: Vec<GhFile> = github_get(&http_client, &token, &url).await?;
+            let gh_files: Vec<GhFile> = github_get_paginated(&http_client, &token, &url).await?;
             Ok(gh_files.into_iter().map(map_file).collect())
         })
     }
@@ -276,20 +359,19 @@ impl ReviewProvider for GitHubProvider {
         repo: &str,
         number: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<ReviewComment>>> + Send>> {
-        let comments_url =
-            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100");
-        let reviews_url =
-            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100");
+        let comments_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments");
+        let reviews_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/reviews");
         let http_client = self.http_client.clone();
         let token = self.token.clone();
 
         Box::pin(async move {
             // Fetch inline code comments
             let gh_comments: Vec<GhReviewComment> =
-                github_get(&http_client, &token, &comments_url).await?;
+                github_get_paginated(&http_client, &token, &comments_url).await?;
 
             // Fetch top-level review submissions (approve, request changes, etc.)
-            let gh_reviews: Vec<GhReview> = github_get(&http_client, &token, &reviews_url).await?;
+            let gh_reviews: Vec<GhReview> =
+                github_get_paginated(&http_client, &token, &reviews_url).await?;
 
             let mut comments: Vec<ReviewComment> =
                 gh_comments.into_iter().map(map_review_comment).collect();
