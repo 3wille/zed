@@ -511,8 +511,7 @@ impl Render for ReviewView {
                     depth,
                     display_name,
                 } => {
-                    let Some((path, status, additions, deletions)) =
-                        file_entries.get(*entry_index)
+                    let Some((path, status, additions, deletions)) = file_entries.get(*entry_index)
                     else {
                         continue;
                     };
@@ -529,12 +528,8 @@ impl Render for ReviewView {
 
                     let indent = *depth as f32 * TREE_INDENT + 8.0;
                     let repo_path = RepoPath::new(path.as_ref()).ok();
-                    let comment_count = file_comments
-                        .get(path)
-                        .map(|c| c.len())
-                        .unwrap_or(0);
-                    let comments_expanded =
-                        self.expanded_comment_files.contains(path);
+                    let comment_count = file_comments.get(path).map(|c| c.len()).unwrap_or(0);
+                    let comments_expanded = self.expanded_comment_files.contains(path);
                     let path_for_toggle = path.clone();
 
                     let file_row = h_flex()
@@ -602,21 +597,15 @@ impl Render for ReviewView {
                                             .size(IconSize::XSmall)
                                             .color(Color::Muted),
                                     )
-                                    .on_click(cx.listener(
-                                        move |this, _event, _window, cx| {
-                                            if this
-                                                .expanded_comment_files
-                                                .contains(&path_for_toggle)
-                                            {
-                                                this.expanded_comment_files
-                                                    .remove(&path_for_toggle);
-                                            } else {
-                                                this.expanded_comment_files
-                                                    .insert(path_for_toggle.clone());
-                                            }
-                                            cx.notify();
-                                        },
-                                    )),
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        if this.expanded_comment_files.contains(&path_for_toggle) {
+                                            this.expanded_comment_files.remove(&path_for_toggle);
+                                        } else {
+                                            this.expanded_comment_files
+                                                .insert(path_for_toggle.clone());
+                                        }
+                                        cx.notify();
+                                    })),
                             )
                         });
 
@@ -647,12 +636,12 @@ impl Render for ReviewView {
                                     .next()
                                     .unwrap_or("")
                                     .to_string();
-                                let comment_repo_path =
-                                    RepoPath::new(path.as_ref()).ok();
+                                let comment_repo_path = RepoPath::new(path.as_ref()).ok();
 
                                 let row = h_flex()
                                     .id(SharedString::from(format!(
-                                        "compact_comment_{}_{}", ix, comment_ix
+                                        "compact_comment_{}_{}",
+                                        ix, comment_ix
                                     )))
                                     .px_2()
                                     .py_0p5()
@@ -687,13 +676,9 @@ impl Render for ReviewView {
 
                                 let row = if let Some(ref repo_path) = comment_repo_path {
                                     let repo_path = repo_path.clone();
-                                    row.on_click(cx.listener(
-                                        move |_this, _event, _window, cx| {
-                                            cx.emit(ReviewViewEvent::OpenFileDiff(
-                                                repo_path.clone(),
-                                            ));
-                                        },
-                                    ))
+                                    row.on_click(cx.listener(move |_this, _event, _window, cx| {
+                                        cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
+                                    }))
                                 } else {
                                     row
                                 };

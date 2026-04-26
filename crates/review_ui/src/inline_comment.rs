@@ -143,10 +143,7 @@ fn render_suggestion_block(
                     .label_size(LabelSize::XSmall)
                     .on_click({
                         move |_event, window: &mut gpui::Window, cx: &mut gpui::App| {
-                            window.dispatch_action(
-                                Box::new(ApplySuggestion { comment_id }),
-                                cx,
-                            );
+                            window.dispatch_action(Box::new(ApplySuggestion { comment_id }), cx);
                         }
                     }),
                 ),

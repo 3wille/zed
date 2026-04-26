@@ -3,8 +3,7 @@ use git::repository::RepoPath;
 use git::status::{TreeDiff, TreeDiffStatus};
 use gpui::{Context, EventEmitter, Render, SharedString, Window, actions, px};
 use ui::{
-    Color, Icon, IconName, IconSize, IntoElement, Label, LabelSize, div, h_flex, prelude::*,
-    v_flex,
+    Color, Icon, IconName, IconSize, IntoElement, Label, LabelSize, div, h_flex, prelude::*, v_flex,
 };
 use zed_actions::review_panel::OpenLocalFile;
 
@@ -208,9 +207,10 @@ impl FileList {
 
     pub fn select_path(&mut self, path: &RepoPath, cx: &mut Context<Self>) {
         self.selected_entry = self.display_entries.iter().position(|de| match de {
-            DisplayEntry::File { entry_index, .. } => {
-                self.entries.get(*entry_index).is_some_and(|(p, _)| p == path)
-            }
+            DisplayEntry::File { entry_index, .. } => self
+                .entries
+                .get(*entry_index)
+                .is_some_and(|(p, _)| p == path),
             DisplayEntry::Directory { .. } => false,
         });
         cx.notify();
@@ -281,12 +281,7 @@ impl FileList {
         }
     }
 
-    fn open_local_file(
-        &mut self,
-        _: &OpenLocalFile,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_local_file(&mut self, _: &OpenLocalFile, _window: &mut Window, cx: &mut Context<Self>) {
         let Some((path, status)) = self.selected_file_entry() else {
             return;
         };
@@ -388,9 +383,7 @@ impl FileList {
                     .entries
                     .iter()
                     .enumerate()
-                    .map(|(ix, (path, _))| {
-                        (ix, path.as_std_path().to_string_lossy().to_string())
-                    })
+                    .map(|(ix, (path, _))| (ix, path.as_std_path().to_string_lossy().to_string()))
                     .collect();
                 let indexed: Vec<(usize, &str)> =
                     paths.iter().map(|(ix, s)| (*ix, s.as_str())).collect();
@@ -590,14 +583,11 @@ impl Render for FileList {
             .on_action(cx.listener(Self::expand_selected))
             .on_action(cx.listener(Self::collapse_selected))
             .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .child(
-                        Label::new(header_text)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
+                h_flex().px_2().py_1().child(
+                    Label::new(header_text)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
             )
             .child(
                 h_flex().px_2().pb_1().child(

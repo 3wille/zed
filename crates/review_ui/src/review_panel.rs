@@ -1,12 +1,12 @@
 use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
-use crate::github_token::resolve_github_token;
+use crate::github_token::{GITHUB_CREDENTIALS_URL, GitHubTokenSource, resolve_github_token};
 use crate::inline_comment::{
     ApplySuggestion, SuggestionBlock, parse_suggestions, render_pr_comment_block,
 };
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
 use crate::review_panel_settings::ReviewPanelSettings;
-use crate::review_provider::{PullRequestInfo, ReviewComment, ReviewProvider};
+use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewComment, ReviewProvider};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use anyhow::Result;
 use collections::HashMap;
@@ -29,8 +29,9 @@ use settings::{self, Settings};
 use std::sync::Arc;
 use text::Point;
 use ui::{
-    Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize, IntoElement, Label,
-    LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, h_flex, prelude::*, v_flex,
+    Button, ButtonSize, ButtonStyle, Color, ContextMenu, DynamicSpacing, IconButton, IconName,
+    IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, TintColor,
+    Tooltip, h_flex, prelude::*, v_flex,
 };
 use workspace::{
     Workspace,
@@ -83,6 +84,10 @@ pub struct ReviewPanel {
     provider: Option<Arc<dyn ReviewProvider>>,
     remote_owner: Option<String>,
     remote_repo: Option<String>,
+    token_editor: Entity<Editor>,
+    auth_source: GitHubTokenSource,
+    configuration_status: Option<SharedString>,
+    configuration_busy: bool,
     selected_pr: Option<PullRequestInfo>,
     pr_ref_fetch_task: Option<gpui::Task<Result<()>>>,
     pending_action: Option<PendingAction>,
@@ -158,6 +163,12 @@ impl ReviewPanel {
             })
         });
 
+        let token_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("GitHub personal access token", window, cx);
+            editor
+        });
+
         let mut this = Self {
             _workspace: weak_workspace,
             project,
@@ -179,6 +190,10 @@ impl ReviewPanel {
             provider: None,
             remote_owner: None,
             remote_repo: None,
+            token_editor,
+            auth_source: GitHubTokenSource::None,
+            configuration_status: None,
+            configuration_busy: false,
             selected_pr: None,
             pr_ref_fetch_task: None,
             pending_action: None,
@@ -344,8 +359,15 @@ impl ReviewPanel {
                         )
                         .separator()
                     })
-                    .entry("Configuration", None, |_window, _cx| {
-                        // TODO: dispatch OpenConfiguration action
+                    .entry("Configuration", None, {
+                        let weak_panel = weak_panel.clone();
+                        move |_window, cx| {
+                            weak_panel
+                                .update(cx, |this, cx| {
+                                    this.set_active_view(ActiveView::Configuration, cx);
+                                })
+                                .ok();
+                        }
                     })
                     .separator()
                     .entry("Full Screen", None, |_window, _cx| {
@@ -402,6 +424,163 @@ impl ReviewPanel {
             )
     }
 
+    fn save_github_token(&mut self, cx: &mut Context<Self>) {
+        let token = self.token_editor.read(cx).text(cx).trim().to_string();
+        if token.is_empty() {
+            self.configuration_status = Some("Enter a GitHub token first".into());
+            cx.notify();
+            return;
+        }
+
+        let credentials_provider = zed_credentials_provider::global(cx);
+        self.configuration_busy = true;
+        self.configuration_status = Some("Saving GitHub token...".into());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = credentials_provider
+                .write_credentials(GITHUB_CREDENTIALS_URL, "Bearer", token.as_bytes(), cx)
+                .await;
+
+            this.update(cx, |this, cx| {
+                this.configuration_busy = false;
+                match result {
+                    Ok(()) => {
+                        this.auth_source = GitHubTokenSource::Keychain;
+                        this.configuration_status = Some("Saved GitHub token to keychain".into());
+                        this.initialize_provider(cx);
+                    }
+                    Err(error) => {
+                        this.configuration_status =
+                            Some(format!("Failed to save token: {error}").into());
+                    }
+                }
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn test_github_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider.clone() else {
+            self.configuration_status = Some("No GitHub provider is configured".into());
+            cx.notify();
+            return;
+        };
+        let Some(owner) = self.remote_owner.clone() else {
+            self.configuration_status = Some("No GitHub remote owner detected".into());
+            cx.notify();
+            return;
+        };
+        let Some(repo) = self.remote_repo.clone() else {
+            self.configuration_status = Some("No GitHub remote repository detected".into());
+            cx.notify();
+            return;
+        };
+
+        self.configuration_busy = true;
+        self.configuration_status = Some("Testing GitHub connection...".into());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = provider
+                .fetch_pull_requests(&owner, &repo, PullRequestState::Open)
+                .await;
+
+            this.update(cx, |this, cx| {
+                this.configuration_busy = false;
+                this.configuration_status = Some(match result {
+                    Ok(pull_requests) => {
+                        format!("Connected to GitHub ({} open PRs)", pull_requests.len()).into()
+                    }
+                    Err(error) => format!("GitHub connection failed: {error}").into(),
+                });
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn render_configuration(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let remote = match (&self.remote_owner, &self.remote_repo) {
+            (Some(owner), Some(repo)) => format!("{owner}/{repo}"),
+            _ => "No GitHub remote detected".to_string(),
+        };
+        let auth_source = self.auth_source.label();
+        let status = self.configuration_status.clone();
+        let busy = self.configuration_busy;
+
+        v_flex()
+            .id("review-configuration")
+            .size_full()
+            .overflow_scroll()
+            .p_3()
+            .gap_3()
+            .child(Label::new("GitHub Configuration").size(LabelSize::Small))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(Label::new(format!("Remote: {remote}")).size(LabelSize::Small))
+                    .child(
+                        Label::new(format!("Authentication: {auth_source}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("Token")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .id("github-token-editor")
+                            .w_full()
+                            .p_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(self.token_editor.clone()),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("save-github-token", "Save Token")
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .loading(busy)
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.save_github_token(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("test-github-connection", "Test Connection")
+                            .size(ButtonSize::Compact)
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.test_github_connection(cx);
+                            })),
+                    ),
+            )
+            .when_some(status, |this, status| {
+                this.child(
+                    Label::new(status)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+    }
+
     fn initialize_provider(&mut self, cx: &mut Context<Self>) {
         let Some(repo) = self.active_repository.clone() else {
             log::info!("review_panel: no active repository");
@@ -428,13 +607,18 @@ impl ReviewPanel {
         self.remote_repo = Some(repo_name);
 
         cx.spawn(async move |this, cx| {
-            let token = resolve_github_token(credentials_provider, cx).await;
+            let resolved_token = resolve_github_token(credentials_provider, cx).await;
+            let token = resolved_token.token;
+            let auth_source = resolved_token.source;
 
             let provider: Arc<dyn ReviewProvider> =
                 Arc::new(GitHubProvider::new(http_client, token));
 
             this.update(cx, |this, cx| {
                 this.provider = Some(provider.clone());
+                this.auth_source = auth_source;
+                this.configuration_status =
+                    Some(format!("GitHub authentication: {}", auth_source.label()).into());
                 if let (Some((pr_list, _)), Some(owner), Some(repo)) = (
                     &this.pull_request_list,
                     this.remote_owner.clone(),
@@ -1090,13 +1274,7 @@ impl Render for ReviewPanel {
                         )
                     }
                 }
-                ActiveView::Configuration => parent.child(
-                    v_flex()
-                        .size_full()
-                        .justify_center()
-                        .items_center()
-                        .child(Label::new("Configuration (coming soon)").color(Color::Muted)),
-                ),
+                ActiveView::Configuration => parent.child(self.render_configuration(cx)),
             })
     }
 }

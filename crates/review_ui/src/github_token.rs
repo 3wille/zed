@@ -2,7 +2,31 @@ use credentials_provider::CredentialsProvider;
 use gpui::AsyncApp;
 use std::sync::Arc;
 
-const GITHUB_CREDENTIALS_URL: &str = "https://api.github.com";
+pub const GITHUB_CREDENTIALS_URL: &str = "https://api.github.com";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitHubTokenSource {
+    Environment,
+    Keychain,
+    GhCli,
+    None,
+}
+
+impl GitHubTokenSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Environment => "GITHUB_TOKEN",
+            Self::Keychain => "Keychain",
+            Self::GhCli => "GitHub CLI",
+            Self::None => "None",
+        }
+    }
+}
+
+pub struct ResolvedGitHubToken {
+    pub token: Option<String>,
+    pub source: GitHubTokenSource,
+}
 
 /// Resolves a GitHub token using a layered fallback chain:
 /// 1. `GITHUB_TOKEN` environment variable
@@ -11,11 +35,14 @@ const GITHUB_CREDENTIALS_URL: &str = "https://api.github.com";
 pub async fn resolve_github_token(
     credential_provider: Arc<dyn CredentialsProvider>,
     cx: &AsyncApp,
-) -> Option<String> {
+) -> ResolvedGitHubToken {
     //First env var
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         if !token.is_empty() {
-            return Some(token);
+            return ResolvedGitHubToken {
+                token: Some(token),
+                source: GitHubTokenSource::Environment,
+            };
         }
     }
 
@@ -25,7 +52,10 @@ pub async fn resolve_github_token(
         .await
     {
         if let Ok(token) = String::from_utf8(token_bytes) {
-            return Some(token);
+            return ResolvedGitHubToken {
+                token: Some(token),
+                source: GitHubTokenSource::Keychain,
+            };
         }
     }
 
@@ -39,10 +69,16 @@ pub async fn resolve_github_token(
         if output.status.success() {
             let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !token.is_empty() {
-                return Some(token);
+                return ResolvedGitHubToken {
+                    token: Some(token),
+                    source: GitHubTokenSource::GhCli,
+                };
             }
         }
     }
 
-    None
+    ResolvedGitHubToken {
+        token: None,
+        source: GitHubTokenSource::None,
+    }
 }

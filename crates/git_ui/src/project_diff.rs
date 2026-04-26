@@ -200,15 +200,16 @@ impl ProjectDiff {
     ) {
         let project = workspace.project().clone();
 
-        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
-            match item.read(cx).diff_base(cx) {
-                DiffBase::Merge {
-                    base_ref: existing_base,
-                    head_ref: existing_head,
-                } if *existing_base == base_ref && *existing_head == head_ref => true,
-                _ => false,
-            }
-        });
+        let existing =
+            workspace
+                .items_of_type::<Self>(cx)
+                .find(|item| match item.read(cx).diff_base(cx) {
+                    DiffBase::Merge {
+                        base_ref: existing_base,
+                        head_ref: existing_head,
+                    } if *existing_base == base_ref && *existing_head == head_ref => true,
+                    _ => false,
+                });
 
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
