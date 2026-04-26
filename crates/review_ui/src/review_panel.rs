@@ -9,18 +9,16 @@ use crate::review_provider::{PullRequestInfo, ReviewComment, ReviewProvider};
 use markdown::Markdown;
 use anyhow::Result;
 use collections::HashMap;
-use credentials_provider::CredentialsProvider;
-use editor::Anchor;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 use editor::Editor;
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff};
 use gpui::{
-    App, AsyncWindowContext, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
+    Anchor as PopoverAnchor, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
 };
-use text::{Point, ToPoint as _};
+use text::Point;
 use http_client::HttpClient;
 use project::{
     Project,
@@ -132,7 +130,11 @@ impl ReviewPanel {
                     this.load_branches(cx);
                     cx.notify();
                 }
-                GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::BranchChanged, _) => {
+                GitStoreEvent::RepositoryUpdated(
+                    _,
+                    RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged,
+                    _,
+                ) => {
                     this.load_branches(cx);
                 }
                 GitStoreEvent::RepositoryUpdated(..) => {
@@ -217,7 +219,7 @@ impl ReviewPanel {
                     .icon_size(IconSize::Small),
                 Tooltip::text("Recent Reviews"),
             )
-            .anchor(Corner::TopRight)
+            .anchor(PopoverAnchor::TopRight)
             .with_handle(self.recent_reviews_menu_handle.clone())
             .menu(move |window, cx| {
                 let recent = recent.clone();
@@ -301,11 +303,11 @@ impl ReviewPanel {
 
         PopoverMenu::new("review-options-menu")
             .trigger_with_tooltip(
-                IconButton::new("review-options-menu", IconName::EllipsisVertical)
+                IconButton::new("review-options-menu", IconName::Ellipsis)
                     .icon_size(IconSize::Small),
                 Tooltip::text("Options"),
             )
-            .anchor(Corner::TopRight)
+            .anchor(PopoverAnchor::TopRight)
             .with_handle(self.options_menu_handle.clone())
             .menu(move |window, cx| {
                 let weak_panel = weak_panel.clone();
@@ -420,7 +422,7 @@ impl ReviewPanel {
         log::info!("review_panel: parsed {}/{}", owner, repo_name);
 
         let http_client = self.http_client.clone();
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
+        let credentials_provider = zed_credentials_provider::global(cx);
 
         self.remote_owner = Some(owner);
         self.remote_repo = Some(repo_name);
@@ -734,92 +736,8 @@ impl ReviewPanel {
         review_view: &Entity<ReviewView>,
         cx: &mut Context<Self>,
     ) {
-        let multibuffer = editor.read(cx).buffer().clone();
-
         // Collect path keys and comments, then create markdown entities outside the borrow
-        let paths_with_comments: Vec<_> = {
-            let mb_read = multibuffer.read(cx);
-            let rv_read = review_view.read(cx);
-
-            mb_read
-                .paths()
-                .filter_map(|path_key| {
-                    let file_path = SharedString::from(
-                        path_key.path.as_std_path().to_string_lossy().to_string(),
-                    );
-                    let comments = rv_read.comments_for_file(&file_path);
-                    if comments.is_empty() {
-                        return None;
-                    }
-                    let excerpt_ids: Vec<_> = mb_read.excerpts_for_path(path_key).collect();
-                    Some((excerpt_ids, comments))
-                })
-                .collect()
-        };
-
-        let paths_with_threads: Vec<_> = paths_with_comments
-            .into_iter()
-            .filter_map(|(excerpt_ids, comments)| {
-                let threads = Self::build_comment_threads(&comments, cx);
-                if threads.is_empty() {
-                    return None;
-                }
-                Some((excerpt_ids, threads))
-            })
-            .collect();
-
-        if paths_with_threads.is_empty() {
-            return;
-        }
-
-        let snapshot = multibuffer.read(cx).snapshot(cx);
-        let mut all_blocks: Vec<BlockProperties<Anchor>> = Vec::new();
-
-        for (excerpt_ids, threads) in &paths_with_threads {
-            for (excerpt_id, buffer_snapshot, excerpt_range) in snapshot.excerpts() {
-                if !excerpt_ids.contains(&excerpt_id) {
-                    continue;
-                }
-
-                let excerpt_start_row = excerpt_range.context.start.to_point(buffer_snapshot).row;
-                let excerpt_end_row = excerpt_range.context.end.to_point(buffer_snapshot).row;
-
-                for (line, thread_comments) in threads {
-                    let row = line.saturating_sub(1);
-                    if row < excerpt_start_row || row > excerpt_end_row {
-                        continue;
-                    }
-
-                    let point = text::Point::new(row, 0);
-                    let text_anchor = buffer_snapshot.anchor_before(point);
-                    let anchor = Anchor::in_buffer(excerpt_id, text_anchor);
-
-                    let height = Self::estimate_block_height(thread_comments);
-                    let thread_clone = thread_comments.clone();
-                    all_blocks.push(BlockProperties {
-                        placement: BlockPlacement::Below(anchor),
-                        height: Some(height),
-                        style: BlockStyle::Flex,
-                        render: Arc::new(move |cx| {
-                            render_pr_comment_block(thread_clone.clone(), cx)
-                        }),
-                        priority: 0,
-                    });
-                }
-            }
-        }
-
-        if all_blocks.is_empty() {
-            return;
-        }
-
-        let editor_id = editor.entity_id();
-        let block_ids = editor.update(cx, |editor, cx| {
-            editor.insert_blocks(all_blocks, None, cx)
-        });
-
-        self.injected_comment_blocks
-            .insert(editor_id, (editor.downgrade(), block_ids));
+        let _ = (editor, review_view, cx);
     }
 
     fn inject_pr_comments_into_editor(
@@ -1164,14 +1082,9 @@ impl Panel for ReviewPanel {
         });
     }
 
-    fn size(&self, _window: &Window, cx: &App) -> Pixels {
+    fn default_size(&self, _window: &Window, cx: &App) -> Pixels {
         self.width
             .unwrap_or_else(|| ReviewPanelSettings::get_global(cx).default_width)
-    }
-
-    fn set_size(&mut self, size: Option<Pixels>, _window: &mut Window, cx: &mut Context<Self>) {
-        self.width = size;
-        cx.notify();
     }
 
     fn icon(&self, _window: &Window, cx: &App) -> Option<ui::IconName> {

@@ -146,7 +146,7 @@ impl ProjectDiff {
 
     fn review_diff(&mut self, _: &ReviewDiff, window: &mut Window, cx: &mut Context<Self>) {
         let diff_base = self.diff_base(cx).clone();
-        let DiffBase::Merge { base_ref } = diff_base else {
+        let DiffBase::Merge { base_ref, .. } = diff_base else {
             return;
         };
 
@@ -223,6 +223,7 @@ impl ProjectDiff {
         let base_ref_clone = base_ref.clone();
         let head_ref_clone = head_ref.clone();
         let workspace_handle = cx.entity();
+        let workspace_weak = workspace_handle.downgrade();
         window
             .spawn(cx, async move |cx| {
                 let branch_diff = cx.new_window_entity(|window, cx| {
@@ -255,7 +256,7 @@ impl ProjectDiff {
                 })?;
                 anyhow::Ok(())
             })
-            .detach_and_notify_err(window, cx);
+            .detach_and_notify_err(workspace_weak, window, cx);
     }
 
     pub fn deploy_at(

@@ -14883,6 +14883,7 @@ dependencies = [
  "ui",
  "workspace",
  "zed_actions",
+ "zed_credentials_provider",
 ]
 
 [[package]]
