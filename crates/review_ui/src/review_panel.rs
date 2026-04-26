@@ -2,12 +2,15 @@ use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
 use crate::github_token::{GITHUB_CREDENTIALS_URL, GitHubTokenSource, resolve_github_token};
 use crate::inline_comment::{
-    ApplySuggestion, SuggestionBlock, ToggleCommentThread, parse_suggestions,
-    render_pr_comment_block,
+    AddCommentAtCursor, ApplySuggestion, CancelInlineCommentDraft, ReplyToCommentThread,
+    SubmitInlineCommentDraft, SuggestionBlock, ToggleCommentThread, parse_suggestions,
+    render_new_comment_block, render_pr_comment_block,
 };
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
 use crate::review_panel_settings::ReviewPanelSettings;
-use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewComment, ReviewProvider};
+use crate::review_provider::{
+    PullRequestInfo, PullRequestState, ReviewComment, ReviewCommentTarget, ReviewProvider,
+};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use anyhow::Result;
 use collections::{HashMap, HashSet};
@@ -28,7 +31,7 @@ use project::{
 };
 use settings::{self, Settings};
 use std::sync::Arc;
-use text::Point;
+use text::{Point, ToPoint as _};
 use ui::{
     Button, ButtonSize, ButtonStyle, Color, ContextMenu, DynamicSpacing, IconButton, IconName,
     IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, TintColor,
@@ -64,6 +67,18 @@ enum PendingAction {
     SelectPullRequest(PullRequestInfo),
 }
 
+#[derive(Clone)]
+enum InlineCommentDraftTarget {
+    NewThread { path: SharedString, line: u32 },
+    Reply { comment_id: u64 },
+}
+
+struct InlineCommentDraft {
+    target: InlineCommentDraftTarget,
+    editor: Entity<Editor>,
+    submitting: bool,
+}
+
 pub struct ReviewPanel {
     _workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -94,6 +109,7 @@ pub struct ReviewPanel {
     pending_action: Option<PendingAction>,
     injected_comment_blocks: HashMap<EntityId, (WeakEntity<Editor>, Vec<CustomBlockId>)>,
     collapsed_comment_threads: HashSet<u64>,
+    inline_comment_draft: Option<InlineCommentDraft>,
     _workspace_subscription: Option<Subscription>,
 }
 
@@ -135,6 +151,65 @@ pub fn register(workspace: &mut Workspace) {
             if let Some(active_editor) = active_editor {
                 panel.inject_comments_for_editor(active_editor, cx);
             }
+        });
+    });
+
+    workspace.register_action(|workspace, action: &ReplyToCommentThread, window, cx| {
+        let comment_id = action.comment_id;
+        let active_editor = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx));
+        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+            return;
+        };
+
+        panel.update(cx, |panel, cx| {
+            panel.start_inline_comment_draft(
+                InlineCommentDraftTarget::Reply { comment_id },
+                active_editor,
+                window,
+                cx,
+            );
+        });
+    });
+
+    workspace.register_action(|workspace, _: &AddCommentAtCursor, window, cx| {
+        let active_editor = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx));
+        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+            return;
+        };
+
+        panel.update(cx, |panel, cx| {
+            panel.start_comment_at_cursor(active_editor, window, cx);
+        });
+    });
+
+    workspace.register_action(|workspace, _: &SubmitInlineCommentDraft, window, cx| {
+        let active_editor = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx));
+        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+            return;
+        };
+
+        panel.update(cx, |panel, cx| {
+            panel.submit_inline_comment_draft(active_editor, window, cx);
+        });
+    });
+
+    workspace.register_action(|workspace, _: &CancelInlineCommentDraft, _window, cx| {
+        let active_editor = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx));
+        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+            return;
+        };
+
+        panel.update(cx, |panel, cx| {
+            panel.inline_comment_draft = None;
+            panel.refresh_injected_comment_blocks(active_editor, cx);
         });
     });
 }
@@ -222,6 +297,7 @@ impl ReviewPanel {
             pending_action: None,
             injected_comment_blocks: HashMap::default(),
             collapsed_comment_threads: HashSet::default(),
+            inline_comment_draft: None,
             _workspace_subscription: workspace_subscription,
         };
         this.initialize_provider(cx);
@@ -381,6 +457,24 @@ impl ReviewPanel {
                                 }
                             },
                         )
+                        .separator()
+                    })
+                    .when(is_review_thread, |menu| {
+                        let weak_panel = weak_panel.clone();
+                        menu.entry("Add Comment at Cursor", None, move |window, cx| {
+                            weak_panel
+                                .update(cx, |this, cx| {
+                                    let active_editor =
+                                        this._workspace.upgrade().and_then(|workspace| {
+                                            workspace
+                                                .read(cx)
+                                                .active_item(cx)
+                                                .and_then(|item| item.act_as::<Editor>(cx))
+                                        });
+                                    this.start_comment_at_cursor(active_editor, window, cx);
+                                })
+                                .ok();
+                        })
                         .separator()
                     })
                     .entry("Configuration", None, {
@@ -940,12 +1034,237 @@ impl ReviewPanel {
             );
             let comments = review_view.read(cx).comments_for_file(&file_path);
             if !comments.is_empty() {
-                self.inject_pr_comments_into_editor(&editor, &comments, cx);
+                self.inject_pr_comments_into_editor(&editor, &file_path, &comments, cx);
+            } else {
+                self.inject_new_comment_draft_into_editor(&editor, &file_path, cx);
             }
             return;
         }
 
         self.inject_for_multibuffer_editor(&editor, &review_view.clone(), cx);
+    }
+
+    fn new_inline_comment_editor(window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
+        cx.new(|cx| {
+            let mut editor = Editor::auto_height(2, 6, window, cx);
+            editor.set_placeholder_text("Leave a comment...", window, cx);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_wrap_guides(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_use_autoclose(false);
+            editor
+        })
+    }
+
+    fn start_inline_comment_draft(
+        &mut self,
+        target: InlineCommentDraftTarget,
+        active_editor: Option<Entity<Editor>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = Self::new_inline_comment_editor(window, cx);
+        window.focus(&editor.focus_handle(cx), cx);
+        self.inline_comment_draft = Some(InlineCommentDraft {
+            target,
+            editor,
+            submitting: false,
+        });
+        self.refresh_injected_comment_blocks(active_editor, cx);
+    }
+
+    fn start_comment_at_cursor(
+        &mut self,
+        active_editor: Option<Entity<Editor>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = active_editor.clone() else {
+            return;
+        };
+        let Some((path, line)) = Self::active_editor_comment_location(&editor, cx) else {
+            return;
+        };
+
+        let target = self
+            .review_view
+            .as_ref()
+            .and_then(|(review_view, _)| {
+                review_view
+                    .read(cx)
+                    .comments_for_file(&path)
+                    .into_iter()
+                    .find(|comment| comment.reply_to.is_none() && comment.line == Some(line))
+            })
+            .map(|comment| InlineCommentDraftTarget::Reply {
+                comment_id: comment.id,
+            })
+            .unwrap_or(InlineCommentDraftTarget::NewThread { path, line });
+
+        self.start_inline_comment_draft(target, active_editor, window, cx);
+    }
+
+    fn active_editor_comment_location(
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> Option<(SharedString, u32)> {
+        let editor = editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let (buffer_anchor, _) =
+            snapshot.anchor_to_buffer_anchor(editor.selections.newest_anchor().head())?;
+        let buffer_snapshot = snapshot.buffer_for_id(buffer_anchor.buffer_id)?;
+        let path_key = snapshot.path_for_buffer(buffer_anchor.buffer_id)?;
+        let point = buffer_anchor.to_point(buffer_snapshot);
+        Some((
+            SharedString::from(path_key.path.as_std_path().to_string_lossy().to_string()),
+            point.row + 1,
+        ))
+    }
+
+    fn refresh_injected_comment_blocks(
+        &mut self,
+        active_editor: Option<Entity<Editor>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.remove_all_injected_blocks(cx);
+        if let Some(active_editor) = active_editor {
+            self.inject_comments_for_editor(active_editor, cx);
+        }
+        cx.notify();
+    }
+
+    fn reply_composer_for(&self, thread_id: Option<u64>) -> Option<Entity<Editor>> {
+        let thread_id = thread_id?;
+        let draft = self.inline_comment_draft.as_ref()?;
+        match draft.target {
+            InlineCommentDraftTarget::Reply { comment_id } if comment_id == thread_id => {
+                Some(draft.editor.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn new_thread_composer_for(
+        &self,
+        file_path: &SharedString,
+    ) -> Option<(u32, Entity<Editor>, bool)> {
+        let draft = self.inline_comment_draft.as_ref()?;
+        match &draft.target {
+            InlineCommentDraftTarget::NewThread { path, line } if path == file_path => {
+                Some((*line, draft.editor.clone(), draft.submitting))
+            }
+            _ => None,
+        }
+    }
+
+    fn inline_comment_draft_submitting(&self) -> bool {
+        self.inline_comment_draft
+            .as_ref()
+            .map(|draft| draft.submitting)
+            .unwrap_or(false)
+    }
+
+    fn submit_inline_comment_draft(
+        &mut self,
+        active_editor: Option<Entity<Editor>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        let Some(owner) = self.remote_owner.clone() else {
+            return;
+        };
+        let Some(repo) = self.remote_repo.clone() else {
+            return;
+        };
+        let Some(selected_pr) = self.selected_pr.clone() else {
+            return;
+        };
+        let Some((review_view, _)) = &self.review_view else {
+            return;
+        };
+        let review_view = review_view.clone();
+        let Some(draft) = self.inline_comment_draft.as_mut() else {
+            return;
+        };
+
+        let body = draft.editor.read(cx).text(cx).to_string();
+        if body.trim().is_empty() {
+            return;
+        }
+
+        let target = draft.target.clone();
+        let provider_target = match &target {
+            InlineCommentDraftTarget::NewThread { path, line } => ReviewCommentTarget::NewThread {
+                path: path.clone(),
+                line: *line,
+                commit_sha: selected_pr.head_sha.clone(),
+            },
+            InlineCommentDraftTarget::Reply { comment_id } => ReviewCommentTarget::Reply {
+                in_reply_to: *comment_id,
+            },
+        };
+
+        draft.submitting = true;
+        self.refresh_injected_comment_blocks(active_editor.clone(), cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = provider
+                .submit_comment(&owner, &repo, selected_pr.number, &body, provider_target)
+                .await;
+
+            this.update_in(cx, |this, _window, cx| {
+                match result {
+                    Ok(mut new_comment) => {
+                        match &target {
+                            InlineCommentDraftTarget::NewThread { path, line } => {
+                                new_comment.path.get_or_insert_with(|| path.clone());
+                                new_comment.line.get_or_insert(*line);
+                            }
+                            InlineCommentDraftTarget::Reply { comment_id } => {
+                                new_comment.reply_to.get_or_insert(*comment_id);
+                                if new_comment.path.is_none() || new_comment.line.is_none() {
+                                    if let Some(parent_comment) = review_view
+                                        .read(cx)
+                                        .pr_comments()
+                                        .iter()
+                                        .find(|comment| comment.id == *comment_id)
+                                    {
+                                        if new_comment.path.is_none() {
+                                            new_comment.path = parent_comment.path.clone();
+                                        }
+                                        if new_comment.line.is_none() {
+                                            new_comment.line = parent_comment.line;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        review_view.update(cx, |review_view, cx| {
+                            review_view.push_comment(new_comment, "Comment posted", cx);
+                        });
+                        this.inline_comment_draft = None;
+                    }
+                    Err(error) => {
+                        if let Some(draft) = this.inline_comment_draft.as_mut() {
+                            draft.submitting = false;
+                        }
+                        review_view.update(cx, |review_view, cx| {
+                            review_view
+                                .set_status_message(format!("Failed to post comment: {error}"), cx);
+                        });
+                    }
+                }
+
+                this.refresh_injected_comment_blocks(active_editor, cx);
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn inject_for_multibuffer_editor(
@@ -989,11 +1308,14 @@ impl ReviewPanel {
                     continue;
                 };
 
-                let height = Self::estimate_block_height(&thread_comments);
                 let thread_id = thread_comments.first().map(|(comment, _, _)| comment.id);
                 let collapsed = thread_id
                     .map(|thread_id| self.collapsed_comment_threads.contains(&thread_id))
                     .unwrap_or(false);
+                let composer = self.reply_composer_for(thread_id);
+                let submitting = self.inline_comment_draft_submitting();
+                let height = Self::estimate_block_height(&thread_comments)
+                    + composer.as_ref().map(|_| 6).unwrap_or(0);
                 let height = if collapsed { 2 } else { height };
                 let thread_clone = thread_comments.clone();
                 blocks.push(BlockProperties {
@@ -1001,10 +1323,43 @@ impl ReviewPanel {
                     height: Some(height),
                     style: BlockStyle::Flex,
                     render: Arc::new(move |cx| {
-                        render_pr_comment_block(thread_clone.clone(), collapsed, cx)
+                        render_pr_comment_block(
+                            thread_clone.clone(),
+                            collapsed,
+                            composer.clone(),
+                            submitting,
+                            cx,
+                        )
                     }),
                     priority: 0,
                 });
+            }
+
+            if let Some((line, editor_entity, submitting)) =
+                self.new_thread_composer_for(&file_path)
+            {
+                let row = line.saturating_sub(1);
+                if row <= buffer_snapshot.max_point().row {
+                    let text_anchor = buffer_snapshot.anchor_before(Point::new(row, 0));
+                    if excerpt.contains(&text_anchor, buffer_snapshot) {
+                        if let Some(anchor) = snapshot.anchor_in_excerpt(text_anchor) {
+                            blocks.push(BlockProperties {
+                                placement: BlockPlacement::Below(anchor),
+                                height: Some(6),
+                                style: BlockStyle::Flex,
+                                render: Arc::new(move |cx| {
+                                    render_new_comment_block(
+                                        line,
+                                        editor_entity.clone(),
+                                        submitting,
+                                        cx,
+                                    )
+                                }),
+                                priority: 1,
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -1021,20 +1376,18 @@ impl ReviewPanel {
     fn inject_pr_comments_into_editor(
         &mut self,
         editor: &Entity<Editor>,
+        file_path: &SharedString,
         comments: &[ReviewComment],
         cx: &mut Context<Self>,
     ) {
         let threads = Self::build_comment_threads(comments, cx);
-        if threads.is_empty() {
-            return;
-        }
 
         let editor_id = editor.entity_id();
         let block_ids = editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let max_row = snapshot.max_point().row;
 
-            let blocks: Vec<_> = threads
+            let mut blocks: Vec<_> = threads
                 .into_iter()
                 .filter_map(|(line, thread_comments)| {
                     let row = line.saturating_sub(1);
@@ -1042,11 +1395,14 @@ impl ReviewPanel {
                         return None;
                     }
                     let anchor = snapshot.anchor_before(Point::new(row, 0));
-                    let height = Self::estimate_block_height(&thread_comments);
                     let thread_id = thread_comments.first().map(|(comment, _, _)| comment.id);
                     let collapsed = thread_id
                         .map(|thread_id| self.collapsed_comment_threads.contains(&thread_id))
                         .unwrap_or(false);
+                    let composer = self.reply_composer_for(thread_id);
+                    let submitting = self.inline_comment_draft_submitting();
+                    let height = Self::estimate_block_height(&thread_comments)
+                        + composer.as_ref().map(|_| 6).unwrap_or(0);
                     let height = if collapsed { 2 } else { height };
                     let thread_clone = thread_comments.clone();
                     Some(BlockProperties {
@@ -1054,14 +1410,77 @@ impl ReviewPanel {
                         height: Some(height),
                         style: BlockStyle::Flex,
                         render: Arc::new(move |cx| {
-                            render_pr_comment_block(thread_clone.clone(), collapsed, cx)
+                            render_pr_comment_block(
+                                thread_clone.clone(),
+                                collapsed,
+                                composer.clone(),
+                                submitting,
+                                cx,
+                            )
                         }),
                         priority: 0,
                     })
                 })
                 .collect();
 
+            if let Some((line, editor_entity, submitting)) = self.new_thread_composer_for(file_path)
+            {
+                let row = line.saturating_sub(1);
+                if row <= max_row {
+                    let anchor = snapshot.anchor_before(Point::new(row, 0));
+                    blocks.push(BlockProperties {
+                        placement: BlockPlacement::Below(anchor),
+                        height: Some(6),
+                        style: BlockStyle::Flex,
+                        render: Arc::new(move |cx| {
+                            render_new_comment_block(line, editor_entity.clone(), submitting, cx)
+                        }),
+                        priority: 1,
+                    });
+                }
+            }
+
             editor.insert_blocks(blocks, None, cx)
+        });
+
+        self.injected_comment_blocks
+            .insert(editor_id, (editor.downgrade(), block_ids));
+    }
+
+    fn inject_new_comment_draft_into_editor(
+        &mut self,
+        editor: &Entity<Editor>,
+        file_path: &SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((line, editor_entity, submitting)) = self.new_thread_composer_for(file_path)
+        else {
+            return;
+        };
+
+        let editor_id = editor.entity_id();
+        let block_ids = editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let max_row = snapshot.max_point().row;
+            let row = line.saturating_sub(1);
+            if row > max_row {
+                return Vec::new();
+            }
+
+            let anchor = snapshot.anchor_before(Point::new(row, 0));
+            editor.insert_blocks(
+                vec![BlockProperties {
+                    placement: BlockPlacement::Below(anchor),
+                    height: Some(6),
+                    style: BlockStyle::Flex,
+                    render: Arc::new(move |cx| {
+                        render_new_comment_block(line, editor_entity.clone(), submitting, cx)
+                    }),
+                    priority: 1,
+                }],
+                None,
+                cx,
+            )
         });
 
         self.injected_comment_blocks

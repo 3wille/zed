@@ -1,4 +1,5 @@
 use crate::review_provider::ReviewComment;
+use editor::Editor;
 use editor::display_map::BlockContext;
 use gpui::{AnyElement, Entity, SharedString};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -49,6 +50,8 @@ pub fn parse_suggestions(body: &str) -> (String, Vec<SuggestionBlock>) {
 pub fn render_pr_comment_block(
     comments: Vec<(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)>,
     collapsed: bool,
+    composer: Option<Entity<Editor>>,
+    submitting: bool,
     cx: &mut BlockContext,
 ) -> AnyElement {
     let colors = cx.theme().colors().clone();
@@ -144,7 +147,131 @@ pub fn render_pr_comment_block(
         comment_body = comment_body.child(row);
     }
 
+    if let Some(editor) = composer {
+        comment_body = comment_body.child(render_comment_composer(
+            editor,
+            submitting,
+            "Reply",
+            "Post reply",
+            cx,
+        ));
+    } else if let Some(comment_id) = thread_id {
+        comment_body = comment_body.child(
+            h_flex().px_2().pb_1().child(
+                Button::new(
+                    SharedString::from(format!("reply_to_comment_{comment_id}")),
+                    "Reply",
+                )
+                .style(ButtonStyle::Subtle)
+                .label_size(LabelSize::XSmall)
+                .on_click(move |_event, window, cx| {
+                    window.dispatch_action(Box::new(ReplyToCommentThread { comment_id }), cx);
+                }),
+            ),
+        );
+    }
+
     container.child(comment_body).into_any_element()
+}
+
+pub fn render_new_comment_block(
+    line: u32,
+    editor: Entity<Editor>,
+    submitting: bool,
+    cx: &mut BlockContext,
+) -> AnyElement {
+    let colors = cx.theme().colors().clone();
+
+    h_flex()
+        .w_full()
+        .max_w(cx.max_width - cx.anchor_x)
+        .items_start()
+        .overflow_x_hidden()
+        .pr_2()
+        .py_1()
+        .gap_1()
+        .border_t_1()
+        .border_b_1()
+        .border_color(colors.border)
+        .bg(colors.editor_background)
+        .child(
+            h_flex().w(cx.anchor_x).justify_end().pr_1().child(
+                Icon::new(IconName::Chat)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            ),
+        )
+        .child(
+            v_flex()
+                .w_full()
+                .overflow_x_hidden()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .child(
+                    Label::new(format!("Add comment on line {line}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(render_comment_composer(
+                    editor,
+                    submitting,
+                    "Comment",
+                    "Post comment",
+                    cx,
+                )),
+        )
+        .into_any_element()
+}
+
+fn render_comment_composer(
+    editor: Entity<Editor>,
+    submitting: bool,
+    editor_id: &'static str,
+    submit_label: &'static str,
+    cx: &mut BlockContext,
+) -> impl IntoElement {
+    let colors = cx.theme().colors().clone();
+
+    v_flex()
+        .id(editor_id)
+        .gap_1()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.surface_background)
+        .child(editor)
+        .child(
+            h_flex()
+                .justify_end()
+                .gap_1()
+                .child(
+                    Button::new("cancel_inline_comment", "Cancel")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::XSmall)
+                        .disabled(submitting)
+                        .on_click(move |_event, window, cx| {
+                            window.dispatch_action(Box::new(CancelInlineCommentDraft), cx);
+                        }),
+                )
+                .child(
+                    Button::new(
+                        "submit_inline_comment",
+                        if submitting {
+                            "Posting..."
+                        } else {
+                            submit_label
+                        },
+                    )
+                    .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .label_size(LabelSize::XSmall)
+                    .disabled(submitting)
+                    .on_click(move |_event, window, cx| {
+                        window.dispatch_action(Box::new(SubmitInlineCommentDraft), cx);
+                    }),
+                ),
+        )
 }
 
 fn render_suggestion_block(
@@ -212,3 +339,17 @@ pub struct ApplySuggestion {
 pub struct ToggleCommentThread {
     pub comment_id: u64,
 }
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+pub struct ReplyToCommentThread {
+    pub comment_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+pub struct AddCommentAtCursor;
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+pub struct SubmitInlineCommentDraft;
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+pub struct CancelInlineCommentDraft;

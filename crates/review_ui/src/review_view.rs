@@ -188,6 +188,26 @@ impl ReviewView {
         &self.pr_comments
     }
 
+    pub fn push_comment(
+        &mut self,
+        comment: ReviewComment,
+        status_message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pr_comments.push(comment);
+        self.status_message = Some(status_message.into());
+        cx.notify();
+    }
+
+    pub fn set_status_message(
+        &mut self,
+        status_message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_message = Some(status_message.into());
+        cx.notify();
+    }
+
     pub fn comments_for_file(&self, path: &SharedString) -> Vec<ReviewComment> {
         let mut parent_comments: Vec<ReviewComment> = Vec::new();
         let mut replies: Vec<ReviewComment> = Vec::new();
