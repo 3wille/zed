@@ -1133,6 +1133,70 @@ impl ReviewPanel {
         cx.notify();
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn set_visual_test_state(
+        &mut self,
+        state: crate::test_support::VisualReviewPanelState,
+        active_editor: Option<Entity<Editor>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pull_request = PullRequestInfo {
+            number: state.pull_request.number,
+            title: state.pull_request.title,
+            author: state.pull_request.author,
+            description: "Review panel visual test pull request".into(),
+            state: PullRequestState::Open,
+            base_ref: state.pull_request.base_ref,
+            head_ref: state.pull_request.head_ref,
+            base_sha: "base-sha".into(),
+            head_sha: state.pull_request.head_sha,
+            created_at: "2026-04-26T17:00:00Z".into(),
+            updated_at: "2026-04-26T17:30:00Z".into(),
+            review_status: crate::review_provider::ReviewStatus::Commented,
+        };
+
+        self.remove_all_injected_blocks(cx);
+        self.provider = None;
+        self.remote_owner = Some("zed-industries".to_string());
+        self.remote_repo = Some("zed".to_string());
+        self.selected_pr = Some(pull_request.clone());
+        self.base_branch = Some(pull_request.base_ref.clone());
+        self.head_branch = Some(pull_request.head_ref.clone());
+        self.collapsed_comment_threads = state.collapsed_threads.into_iter().collect();
+        self.inline_comment_draft = state.draft.map(|draft| {
+            let (target, body) = match draft {
+                crate::test_support::VisualInlineCommentDraft::NewThread { path, line, body } => {
+                    (InlineCommentDraftTarget::NewThread { path, line }, body)
+                }
+                crate::test_support::VisualInlineCommentDraft::Reply { comment_id, body } => {
+                    (InlineCommentDraftTarget::Reply { comment_id }, body)
+                }
+            };
+            let editor = Self::new_inline_comment_editor(window, cx);
+            editor.update(cx, |editor, cx| {
+                editor.set_text(body.to_string(), window, cx);
+            });
+            InlineCommentDraft {
+                target,
+                editor,
+                submitting: false,
+            }
+        });
+
+        self.create_review_view(&pull_request, window, cx);
+        if let Some((review_view, _)) = &self.review_view {
+            review_view.update(cx, |review_view, cx| {
+                review_view.set_visual_test_data(state.files, state.comments, state.tree_view, cx);
+            });
+        }
+
+        self.set_active_view(ActiveView::ReviewThread, cx);
+        if let Some(active_editor) = active_editor {
+            self.inject_comments_for_editor(active_editor, cx);
+        }
+    }
+
     fn reply_composer_for(&self, thread_id: Option<u64>) -> Option<Entity<Editor>> {
         let thread_id = thread_id?;
         let draft = self.inline_comment_draft.as_ref()?;

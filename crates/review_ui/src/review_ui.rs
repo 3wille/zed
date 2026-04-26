@@ -11,6 +11,9 @@ mod review_view;
 
 pub use review_panel::ReviewPanel;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use gpui::App;
 use workspace::Workspace;
 

@@ -208,6 +208,47 @@ impl ReviewView {
         cx.notify();
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn set_visual_test_data(
+        &mut self,
+        files: Vec<crate::test_support::VisualPullRequestFile>,
+        comments: Vec<crate::test_support::VisualReviewComment>,
+        tree_view: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.pr_api_files = files
+            .into_iter()
+            .map(|file| PullRequestFile {
+                path: file.path,
+                status: file.status.into(),
+                additions: file.additions,
+                deletions: file.deletions,
+            })
+            .collect();
+        self.pr_comments = comments
+            .into_iter()
+            .map(|comment| ReviewComment {
+                id: comment.id,
+                author: comment.author,
+                body: comment.body,
+                created_at: comment.created_at,
+                path: Some(comment.path),
+                line: Some(comment.line),
+                reply_to: comment.reply_to,
+                diff_hunk: None,
+            })
+            .collect();
+        self.view_mode = if tree_view {
+            ViewMode::Tree
+        } else {
+            ViewMode::Flat
+        };
+        self.expanded_dirs.clear();
+        self.tree_dirs_initialized = false;
+        self.rebuild_display_entries();
+        cx.notify();
+    }
+
     pub fn comments_for_file(&self, path: &SharedString) -> Vec<ReviewComment> {
         let mut parent_comments: Vec<ReviewComment> = Vec::new();
         let mut replies: Vec<ReviewComment> = Vec::new();
