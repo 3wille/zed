@@ -23,6 +23,7 @@ settings.workspace = true
 ui.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
+zed_credentials_provider.workspace = true
 menu.workspace = true
 project.workspace = true
 git.workspace = true

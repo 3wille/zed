@@ -7,7 +7,7 @@ use collections::{HashMap, HashSet};
 use editor::Editor;
 use git::repository::RepoPath;
 use git::status::{TreeDiff, TreeDiffStatus};
-use gpui::{Context, Corner, Entity, EventEmitter, Focusable, Render, SharedString, Window, px};
+use gpui::{Anchor, Context, Entity, EventEmitter, Focusable, Render, SharedString, Window, px};
 use std::sync::Arc;
 use ui::{
     ButtonLike, ButtonSize, Color, ContextMenu, ElevationIndex, Icon, IconButton, IconName,
@@ -368,7 +368,7 @@ impl ReviewView {
                     ),
             )
             .with_handle(self.review_action_menu_handle.clone())
-            .anchor(Corner::TopRight)
+            .anchor(Anchor::TopRight)
             .menu(move |window, cx| {
                 let weak_view = weak_view.clone();
                 let current = current.clone();

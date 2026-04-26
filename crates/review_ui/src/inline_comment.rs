@@ -3,8 +3,8 @@ use editor::display_map::BlockContext;
 use gpui::{AnyElement, Entity, SharedString};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use ui::{
-    Button, ButtonStyle, Color, FluentBuilder, IconName, IntoElement, Label, LabelSize, h_flex,
-    prelude::*, v_flex,
+    Button, ButtonStyle, Color, FluentBuilder, Icon, IconName, IntoElement, Label, LabelSize,
+    h_flex, prelude::*, v_flex,
 };
 
 #[derive(Clone, Debug)]
@@ -138,12 +138,11 @@ fn render_suggestion_block(
                         SharedString::from(format!("apply_suggestion_{}", comment_id)),
                         "Apply",
                     )
-                    .icon(IconName::Check)
-                    .icon_size(ui::IconSize::XSmall)
+                    .start_icon(Icon::new(IconName::Check).size(ui::IconSize::XSmall))
                     .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                     .label_size(LabelSize::XSmall)
                     .on_click({
-                        move |_event, window, cx| {
+                        move |_event, window: &mut gpui::Window, cx: &mut gpui::App| {
                             window.dispatch_action(
                                 Box::new(ApplySuggestion { comment_id }),
                                 cx,

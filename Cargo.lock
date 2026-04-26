@@ -14863,7 +14863,7 @@ dependencies = [
  "credentials_provider",
  "editor",
  "fs",
- "futures 0.3.31",
+ "futures 0.3.32",
  "git",
  "git_hosting_providers",
  "git_ui",
@@ -14873,7 +14873,7 @@ dependencies = [
  "markdown",
  "menu",
  "project",
- "schemars",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings",
@@ -14882,6 +14882,7 @@ dependencies = [
  "ui",
  "workspace",
  "zed_actions",
+ "zed_credentials_provider",
 ]
 
 [[package]]

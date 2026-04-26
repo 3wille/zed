@@ -1,6 +1,6 @@
 use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewProvider};
 use editor::{Editor, EditorEvent};
-use gpui::{Context, Corner, Entity, EventEmitter, Render, SharedString, Window};
+use gpui::{Anchor, Context, Entity, EventEmitter, Render, SharedString, Window};
 use std::sync::Arc;
 use ui::{
     Color, ContextMenu, IconButton, IconName, IconSize, IntoElement, Label, LabelSize,
@@ -199,7 +199,7 @@ impl Render for PullRequestList {
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text(format!("Filter: {}", filter_label))),
                             )
-                            .anchor(Corner::TopRight)
+                            .anchor(Anchor::TopRight)
                             .with_handle(self.filter_menu_handle.clone())
                             .menu({
                                 let weak_list = weak_list.clone();

@@ -167,7 +167,6 @@ members = [
     "crates/repl",
     "crates/reqwest_client",
     "crates/review_ui",
-    "crates/rich_text",
     "crates/rope",
     "crates/rpc",
     "crates/rules_library",
