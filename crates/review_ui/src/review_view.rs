@@ -1,5 +1,7 @@
 use crate::comment_card::CommentCard;
-use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
+use crate::file_list::{
+    DisplayEntry, ViewMode, build_file_tree, expand_all_directories, flatten_file_tree,
+};
 use crate::review_provider::{
     FileChangeStatus, PullRequestFile, PullRequestInfo, ReviewComment, ReviewProvider, ReviewStatus,
 };
@@ -38,6 +40,7 @@ pub struct ReviewView {
     review_action_menu_handle: PopoverMenuHandle<ContextMenu>,
     view_mode: ViewMode,
     expanded_dirs: HashSet<SharedString>,
+    tree_dirs_initialized: bool,
     display_entries: Vec<DisplayEntry>,
     expanded_comment_files: HashSet<SharedString>,
 }
@@ -80,6 +83,7 @@ impl ReviewView {
             review_action_menu_handle: PopoverMenuHandle::default(),
             view_mode: ViewMode::Flat,
             expanded_dirs: HashSet::default(),
+            tree_dirs_initialized: false,
             display_entries: Vec::new(),
             expanded_comment_files: HashSet::default(),
         };
@@ -92,6 +96,8 @@ impl ReviewView {
         self.tree_diff = tree_diff.map(|td| TreeDiff {
             entries: td.entries.clone(),
         });
+        self.expanded_dirs.clear();
+        self.tree_dirs_initialized = false;
         self.rebuild_display_entries();
         cx.notify();
     }
@@ -131,6 +137,10 @@ impl ReviewView {
                     .map(|(ix, (path, _, _, _))| (ix, path.as_ref()))
                     .collect();
                 let tree = build_file_tree(&paths);
+                if !self.tree_dirs_initialized {
+                    expand_all_directories(&tree, &mut self.expanded_dirs);
+                    self.tree_dirs_initialized = true;
+                }
                 flatten_file_tree(&tree, 0, &self.expanded_dirs, &mut self.display_entries);
             }
         }
@@ -259,6 +269,8 @@ impl ReviewView {
                 match result {
                     Ok(files) => {
                         this.pr_api_files = files;
+                        this.expanded_dirs.clear();
+                        this.tree_dirs_initialized = false;
                         this.rebuild_display_entries();
                     }
                     Err(error) => {
