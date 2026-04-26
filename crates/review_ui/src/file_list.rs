@@ -55,6 +55,7 @@ pub struct FileList {
     selected_entry: Option<usize>,
     view_mode: ViewMode,
     expanded_dirs: HashSet<SharedString>,
+    tree_dirs_initialized: bool,
     display_entries: Vec<DisplayEntry>,
 }
 
@@ -162,6 +163,19 @@ pub fn flatten_file_tree(
     }
 }
 
+pub fn expand_all_directories(node: &TreeNode, expanded_dirs: &mut HashSet<SharedString>) {
+    for child in node.children.values() {
+        let (terminal, _) = compact_directory_chain(child);
+        let path = terminal
+            .path
+            .clone()
+            .or_else(|| child.path.clone())
+            .unwrap_or_default();
+        expanded_dirs.insert(path);
+        expand_all_directories(terminal, expanded_dirs);
+    }
+}
+
 impl FileList {
     pub fn new(
         base_branch: Option<SharedString>,
@@ -178,6 +192,7 @@ impl FileList {
             selected_entry: None,
             view_mode: ViewMode::Flat,
             expanded_dirs: HashSet::default(),
+            tree_dirs_initialized: false,
             display_entries: Vec::new(),
         };
         this.rebuild_display_entries();
@@ -196,6 +211,8 @@ impl FileList {
         self.entries = diff.map(sort_diff_entries).unwrap_or_default();
         self.viewed_files.clear();
         self.selected_entry = None;
+        self.expanded_dirs.clear();
+        self.tree_dirs_initialized = false;
         self.rebuild_display_entries();
         cx.notify();
     }
@@ -388,6 +405,10 @@ impl FileList {
                 let indexed: Vec<(usize, &str)> =
                     paths.iter().map(|(ix, s)| (*ix, s.as_str())).collect();
                 let tree = build_file_tree(&indexed);
+                if !self.tree_dirs_initialized {
+                    expand_all_directories(&tree, &mut self.expanded_dirs);
+                    self.tree_dirs_initialized = true;
+                }
                 flatten_file_tree(&tree, 0, &self.expanded_dirs, &mut self.display_entries);
             }
         }
