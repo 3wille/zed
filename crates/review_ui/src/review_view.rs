@@ -29,6 +29,7 @@ pub struct ReviewView {
     selected_pr: PullRequestInfo,
     pr_comments: Vec<ReviewComment>,
     pr_comments_loading: bool,
+    status_message: Option<SharedString>,
     pr_api_files: Vec<PullRequestFile>,
     tree_diff: Option<TreeDiff>,
     comment_editor: Entity<Editor>,
@@ -70,6 +71,7 @@ impl ReviewView {
             selected_pr: pull_request,
             pr_comments: Vec::new(),
             pr_comments_loading: false,
+            status_message: None,
             pr_api_files: Vec::new(),
             tree_diff: None,
             comment_editor,
@@ -215,13 +217,22 @@ impl ReviewView {
         };
 
         self.pr_comments_loading = true;
+        self.status_message = None;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let comments = provider.fetch_reviews(&owner, &repo, pr_number).await?;
+            let result = provider.fetch_reviews(&owner, &repo, pr_number).await;
             this.update(cx, |this, cx| {
-                this.pr_comments = comments;
                 this.pr_comments_loading = false;
+                match result {
+                    Ok(comments) => {
+                        this.pr_comments = comments;
+                    }
+                    Err(error) => {
+                        this.status_message =
+                            Some(format!("Failed to load review comments: {error}").into());
+                    }
+                }
                 cx.notify();
             })?;
             anyhow::Ok(())
@@ -241,12 +252,20 @@ impl ReviewView {
         };
 
         cx.spawn(async move |this, cx| {
-            let files = provider
+            let result = provider
                 .fetch_pull_request_files(&owner, &repo, pr_number)
-                .await?;
+                .await;
             this.update(cx, |this, cx| {
-                this.pr_api_files = files;
-                this.rebuild_display_entries();
+                match result {
+                    Ok(files) => {
+                        this.pr_api_files = files;
+                        this.rebuild_display_entries();
+                    }
+                    Err(error) => {
+                        this.status_message =
+                            Some(format!("Failed to load changed files: {error}").into());
+                    }
+                }
                 cx.notify();
             })?;
             anyhow::Ok(())
@@ -269,6 +288,7 @@ impl ReviewView {
         let action = self.review_action.clone();
         let pr_number = self.selected_pr.number;
         self.comment_submitting = true;
+        self.status_message = None;
         cx.notify();
 
         match action {
@@ -278,15 +298,24 @@ impl ReviewView {
                     return;
                 }
                 cx.spawn_in(window, async move |this, cx| {
-                    let new_comment = provider
+                    let result = provider
                         .submit_comment(&owner, &repo, pr_number, &body, None, None)
-                        .await?;
+                        .await;
                     this.update_in(cx, |this, window, cx| {
-                        this.pr_comments.push(new_comment);
                         this.comment_submitting = false;
-                        this.comment_editor.update(cx, |editor, cx| {
-                            editor.clear(window, cx);
-                        });
+                        match result {
+                            Ok(new_comment) => {
+                                this.pr_comments.push(new_comment);
+                                this.comment_editor.update(cx, |editor, cx| {
+                                    editor.clear(window, cx);
+                                });
+                                this.status_message = Some("Comment posted".into());
+                            }
+                            Err(error) => {
+                                this.status_message =
+                                    Some(format!("Failed to post comment: {error}").into());
+                            }
+                        }
                         cx.notify();
                     })?;
                     anyhow::Ok(())
@@ -300,12 +329,21 @@ impl ReviewView {
                     Some(body)
                 };
                 cx.spawn_in(window, async move |this, cx| {
-                    provider
+                    let result = provider
                         .submit_review(&owner, &repo, pr_number, action, body_opt.as_deref())
-                        .await?;
+                        .await;
                     this.update_in(cx, |this, _window, cx| {
                         this.comment_submitting = false;
-                        this.load_pr_comments(pr_number, cx);
+                        match result {
+                            Ok(()) => {
+                                this.status_message = Some("Review submitted".into());
+                                this.load_pr_comments(pr_number, cx);
+                            }
+                            Err(error) => {
+                                this.status_message =
+                                    Some(format!("Failed to submit review: {error}").into());
+                            }
+                        }
                         cx.notify();
                     })?;
                     anyhow::Ok(())
@@ -708,6 +746,16 @@ impl Render for ReviewView {
             scrollable = scrollable.child(
                 h_flex().px_2().py_1().child(
                     Label::new("Loading comments...")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+
+        if let Some(message) = &self.status_message {
+            scrollable = scrollable.child(
+                h_flex().px_2().py_1().child(
+                    Label::new(message.clone())
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 ),

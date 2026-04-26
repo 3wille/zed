@@ -18,6 +18,7 @@ pub struct PullRequestList {
     remote_repo: Option<String>,
     pull_requests: Vec<PullRequestInfo>,
     loading: bool,
+    load_error: Option<SharedString>,
     filter: PullRequestState,
     filter_menu_handle: PopoverMenuHandle<ContextMenu>,
     search_editor: Entity<Editor>,
@@ -56,6 +57,7 @@ impl PullRequestList {
             remote_repo,
             pull_requests: Vec::new(),
             loading: false,
+            load_error: None,
             filter: PullRequestState::Open,
             filter_menu_handle: PopoverMenuHandle::default(),
             search_editor,
@@ -98,13 +100,23 @@ impl PullRequestList {
 
         let state = self.filter.clone();
         self.loading = true;
+        self.load_error = None;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let pull_requests = provider.fetch_pull_requests(&owner, &repo, state).await?;
+            let result = provider.fetch_pull_requests(&owner, &repo, state).await;
             this.update(cx, |this, cx| {
-                this.pull_requests = pull_requests;
                 this.loading = false;
+                match result {
+                    Ok(pull_requests) => {
+                        this.pull_requests = pull_requests;
+                        this.load_error = None;
+                    }
+                    Err(error) => {
+                        this.load_error =
+                            Some(format!("Failed to load pull requests: {error}").into());
+                    }
+                }
                 cx.notify();
             })?;
             anyhow::Ok(())
@@ -144,6 +156,23 @@ impl Render for PullRequestList {
                 .items_center()
                 .child(Label::new("Loading pull requests...").color(Color::Muted))
                 .into_any_element();
+        }
+
+        if self.pull_requests.is_empty() {
+            if let Some(error) = &self.load_error {
+                return v_flex()
+                    .size_full()
+                    .justify_center()
+                    .items_center()
+                    .gap_2()
+                    .child(Label::new("Could not load pull requests").color(Color::Muted))
+                    .child(
+                        Label::new(error.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element();
+            }
         }
 
         if self.pull_requests.is_empty() {
@@ -269,6 +298,15 @@ impl Render for PullRequestList {
                         .color(Color::Muted),
                 ),
             )
+            .when_some(self.load_error.clone(), |this, error| {
+                this.child(
+                    h_flex().px_2().pb_1().child(
+                        Label::new(error)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
             .children(filtered.into_iter().map(|pr| {
                 let number = pr.number;
                 let title = pr.title.clone();
