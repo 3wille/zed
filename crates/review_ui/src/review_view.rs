@@ -3,7 +3,8 @@ use crate::file_list::{
     DisplayEntry, ViewMode, build_file_tree, expand_all_directories, flatten_file_tree,
 };
 use crate::review_provider::{
-    FileChangeStatus, PullRequestFile, PullRequestInfo, ReviewComment, ReviewProvider, ReviewStatus,
+    FileChangeStatus, PullRequestFile, PullRequestInfo, ReviewComment, ReviewCommentTarget,
+    ReviewProvider, ReviewStatus,
 };
 use collections::{HashMap, HashSet};
 use editor::Editor;
@@ -311,7 +312,13 @@ impl ReviewView {
                 }
                 cx.spawn_in(window, async move |this, cx| {
                     let result = provider
-                        .submit_comment(&owner, &repo, pr_number, &body, None, None)
+                        .submit_comment(
+                            &owner,
+                            &repo,
+                            pr_number,
+                            &body,
+                            ReviewCommentTarget::General,
+                        )
                         .await;
                     this.update_in(cx, |this, window, cx| {
                         this.comment_submitting = false;

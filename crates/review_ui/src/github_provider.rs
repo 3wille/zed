@@ -404,29 +404,65 @@ impl ReviewProvider for GitHubProvider {
         repo: &str,
         number: u32,
         body: &str,
-        path: Option<&str>,
-        line: Option<u32>,
+        target: ReviewCommentTarget,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReviewComment>> + Send>> {
-        // General PR comments use the issues API
-        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/issues/{number}/comments");
-        let json = serde_json::json!({ "body": body }).to_string();
         let http_client = self.http_client.clone();
         let token = self.token.clone();
-        let path = path.map(|p| SharedString::from(p.to_string()));
-        let line = line;
+        let owner = owner.to_string();
+        let repo = repo.to_string();
+        let body = body.to_string();
 
         Box::pin(async move {
-            let gh_comment: GhIssueComment = github_post(&http_client, &token, &url, json).await?;
-            Ok(ReviewComment {
-                id: gh_comment.id,
-                author: gh_comment.user.login.into(),
-                body: gh_comment.body.into(),
-                created_at: gh_comment.created_at.into(),
-                path,
-                line,
-                reply_to: None,
-                diff_hunk: None,
-            })
+            match target {
+                ReviewCommentTarget::General => {
+                    let url =
+                        format!("{GITHUB_API_URL}/repos/{owner}/{repo}/issues/{number}/comments");
+                    let json = serde_json::json!({ "body": body }).to_string();
+                    let gh_comment: GhIssueComment =
+                        github_post(&http_client, &token, &url, json).await?;
+
+                    Ok(ReviewComment {
+                        id: gh_comment.id,
+                        author: gh_comment.user.login.into(),
+                        body: gh_comment.body.into(),
+                        created_at: gh_comment.created_at.into(),
+                        path: None,
+                        line: None,
+                        reply_to: None,
+                        diff_hunk: None,
+                    })
+                }
+                ReviewCommentTarget::NewThread {
+                    path,
+                    line,
+                    commit_sha,
+                } => {
+                    let url =
+                        format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments");
+                    let json = serde_json::json!({
+                        "body": body,
+                        "commit_id": commit_sha,
+                        "path": path,
+                        "line": line,
+                        "side": "RIGHT",
+                    })
+                    .to_string();
+                    let gh_comment: GhReviewComment =
+                        github_post(&http_client, &token, &url, json).await?;
+
+                    Ok(map_review_comment(gh_comment))
+                }
+                ReviewCommentTarget::Reply { in_reply_to } => {
+                    let url = format!(
+                        "{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments/{in_reply_to}/replies"
+                    );
+                    let json = serde_json::json!({ "body": body }).to_string();
+                    let gh_comment: GhReviewComment =
+                        github_post(&http_client, &token, &url, json).await?;
+
+                    Ok(map_review_comment(gh_comment))
+                }
+            }
         })
     }
 

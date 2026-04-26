@@ -47,6 +47,19 @@ pub struct ReviewComment {
 }
 
 #[derive(Clone, Debug)]
+pub enum ReviewCommentTarget {
+    General,
+    NewThread {
+        path: SharedString,
+        line: u32,
+        commit_sha: SharedString,
+    },
+    Reply {
+        in_reply_to: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub enum CheckStatus {
     Pending,
     Success,
@@ -132,8 +145,7 @@ pub trait ReviewProvider: Send + Sync {
         repo: &str,
         number: u32,
         body: &str,
-        path: Option<&str>,
-        line: Option<u32>,
+        target: ReviewCommentTarget,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReviewComment>> + Send>>;
 
     fn submit_review(
