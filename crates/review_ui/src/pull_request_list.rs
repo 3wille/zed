@@ -2,11 +2,11 @@ use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewProvider};
 use editor::{Editor, EditorEvent};
 use gpui::{Anchor, Context, Entity, EventEmitter, Render, SharedString, Window};
 use std::sync::Arc;
+use ui::PopoverMenu;
 use ui::{
     Color, ContextMenu, IconButton, IconName, IconSize, IntoElement, Label, LabelSize,
     PopoverMenuHandle, Tooltip, div, h_flex, prelude::*, v_flex,
 };
-use ui::PopoverMenu;
 
 pub enum PullRequestListEvent {
     Selected(PullRequestInfo),
@@ -39,11 +39,15 @@ impl PullRequestList {
             editor
         });
 
-        cx.subscribe_in(&search_editor, window, |_this, _editor, event: &EditorEvent, _window, cx| {
-            if matches!(event, EditorEvent::BufferEdited { .. }) {
-                cx.notify();
-            }
-        })
+        cx.subscribe_in(
+            &search_editor,
+            window,
+            |_this, _editor, event: &EditorEvent, _window, cx| {
+                if matches!(event, EditorEvent::BufferEdited { .. }) {
+                    cx.notify();
+                }
+            },
+        )
         .detach();
 
         Self {
@@ -235,19 +239,23 @@ impl Render for PullRequestList {
                                                         .ok();
                                                 }
                                             })
-                                            .entry("All", None, {
-                                                let weak_list = weak_list.clone();
-                                                move |_window, cx| {
-                                                    weak_list
-                                                        .update(cx, |this, cx| {
-                                                            this.set_filter(
-                                                                PullRequestState::All,
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                }
-                                            })
+                                            .entry(
+                                                "All",
+                                                None,
+                                                {
+                                                    let weak_list = weak_list.clone();
+                                                    move |_window, cx| {
+                                                        weak_list
+                                                            .update(cx, |this, cx| {
+                                                                this.set_filter(
+                                                                    PullRequestState::All,
+                                                                    cx,
+                                                                );
+                                                            })
+                                                            .ok();
+                                                    }
+                                                },
+                                            )
                                         },
                                     ))
                                 }
