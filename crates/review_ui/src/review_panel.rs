@@ -1,16 +1,17 @@
 use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
-use crate::inline_comment::{ApplySuggestion, parse_suggestions, render_pr_comment_block, SuggestionBlock};
-use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
-use crate::review_view::{ReviewView, ReviewViewEvent};
 use crate::github_token::resolve_github_token;
+use crate::inline_comment::{
+    ApplySuggestion, SuggestionBlock, parse_suggestions, render_pr_comment_block,
+};
+use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
 use crate::review_panel_settings::ReviewPanelSettings;
 use crate::review_provider::{PullRequestInfo, ReviewComment, ReviewProvider};
-use markdown::Markdown;
+use crate::review_view::{ReviewView, ReviewViewEvent};
 use anyhow::Result;
 use collections::HashMap;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
-use editor::Editor;
+use editor::{Anchor, Editor};
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff};
@@ -18,14 +19,15 @@ use gpui::{
     Anchor as PopoverAnchor, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
     FocusHandle, Focusable, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
 };
-use text::Point;
 use http_client::HttpClient;
+use markdown::Markdown;
 use project::{
     Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::{self, Settings};
 use std::sync::Arc;
+use text::Point;
 use ui::{
     Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize, IntoElement, Label,
     LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, h_flex, prelude::*, v_flex,
@@ -245,9 +247,7 @@ impl ReviewPanel {
                             } else {
                                 format!(
                                     "{}..{} ({} files)",
-                                    entry.base_branch,
-                                    entry.head_branch,
-                                    entry.file_count
+                                    entry.base_branch, entry.head_branch, entry.file_count
                                 )
                             };
                             let base = entry.base_branch.clone();
@@ -435,9 +435,11 @@ impl ReviewPanel {
 
             this.update(cx, |this, cx| {
                 this.provider = Some(provider.clone());
-                if let (Some((pr_list, _)), Some(owner), Some(repo)) =
-                    (&this.pull_request_list, this.remote_owner.clone(), this.remote_repo.clone())
-                {
+                if let (Some((pr_list, _)), Some(owner), Some(repo)) = (
+                    &this.pull_request_list,
+                    this.remote_owner.clone(),
+                    this.remote_repo.clone(),
+                ) {
                     pr_list.update(cx, |list, cx| {
                         list.set_provider(provider, owner, repo, cx);
                     });
@@ -477,20 +479,21 @@ impl ReviewPanel {
                 cx,
             )
         });
-        let subscription =
-            cx.subscribe_in(&review_view, window, |this, _view, event, window, cx| {
-                match event {
-                    ReviewViewEvent::OpenFileDiff(path) => {
-                        this.open_file_diff(path.clone(), cx);
-                    }
-                    ReviewViewEvent::Back => {
-                        this.selected_pr = None;
-                        this.review_view = None;
-                        this.remove_all_injected_blocks(cx);
-                        this.show_pull_request_list(window, cx);
-                    }
+        let subscription = cx.subscribe_in(
+            &review_view,
+            window,
+            |this, _view, event, window, cx| match event {
+                ReviewViewEvent::OpenFileDiff(path) => {
+                    this.open_file_diff(path.clone(), cx);
                 }
-            });
+                ReviewViewEvent::Back => {
+                    this.selected_pr = None;
+                    this.review_view = None;
+                    this.remove_all_injected_blocks(cx);
+                    this.show_pull_request_list(window, cx);
+                }
+            },
+        );
         self.review_view = Some((review_view, subscription));
     }
 
@@ -656,12 +659,11 @@ impl ReviewPanel {
                     cx,
                 )
             });
-            let subscription =
-                cx.subscribe(&pr_list, |this, _pr_list, event, cx| match event {
-                    PullRequestListEvent::Selected(pr) => {
-                        this.select_pull_request(&pr.clone(), cx);
-                    }
-                });
+            let subscription = cx.subscribe(&pr_list, |this, _pr_list, event, cx| match event {
+                PullRequestListEvent::Selected(pr) => {
+                    this.select_pull_request(&pr.clone(), cx);
+                }
+            });
             self.pull_request_list = Some((pr_list, subscription));
         }
 
@@ -736,8 +738,61 @@ impl ReviewPanel {
         review_view: &Entity<ReviewView>,
         cx: &mut Context<Self>,
     ) {
-        // Collect path keys and comments, then create markdown entities outside the borrow
-        let _ = (editor, review_view, cx);
+        let multibuffer = editor.read(cx).buffer().clone();
+        let snapshot = multibuffer.read(cx).snapshot(cx);
+        let mut blocks: Vec<BlockProperties<Anchor>> = Vec::new();
+
+        for excerpt in snapshot.excerpts() {
+            let buffer_id = excerpt.context.start.buffer_id;
+            let Some(buffer_snapshot) = snapshot.buffer_for_id(buffer_id) else {
+                continue;
+            };
+            let Some(path_key) = snapshot.path_for_buffer(buffer_id) else {
+                continue;
+            };
+
+            let file_path =
+                SharedString::from(path_key.path.as_std_path().to_string_lossy().to_string());
+            let comments = review_view.read(cx).comments_for_file(&file_path);
+            if comments.is_empty() {
+                continue;
+            }
+
+            for (line, thread_comments) in Self::build_comment_threads(&comments, cx) {
+                let row = line.saturating_sub(1);
+                if row > buffer_snapshot.max_point().row {
+                    continue;
+                }
+
+                let text_anchor = buffer_snapshot.anchor_before(Point::new(row, 0));
+                if !excerpt.contains(&text_anchor, buffer_snapshot) {
+                    continue;
+                }
+
+                let Some(anchor) = snapshot.anchor_in_excerpt(text_anchor) else {
+                    continue;
+                };
+
+                let height = Self::estimate_block_height(&thread_comments);
+                let thread_clone = thread_comments.clone();
+                blocks.push(BlockProperties {
+                    placement: BlockPlacement::Below(anchor),
+                    height: Some(height),
+                    style: BlockStyle::Flex,
+                    render: Arc::new(move |cx| render_pr_comment_block(thread_clone.clone(), cx)),
+                    priority: 0,
+                });
+            }
+        }
+
+        if blocks.is_empty() {
+            return;
+        }
+
+        let editor_id = editor.entity_id();
+        let block_ids = editor.update(cx, |editor, cx| editor.insert_blocks(blocks, None, cx));
+        self.injected_comment_blocks
+            .insert(editor_id, (editor.downgrade(), block_ids));
     }
 
     fn inject_pr_comments_into_editor(
@@ -800,7 +855,10 @@ impl ReviewPanel {
     fn build_comment_threads(
         comments: &[ReviewComment],
         cx: &mut App,
-    ) -> Vec<(u32, Vec<(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)>)> {
+    ) -> Vec<(
+        u32,
+        Vec<(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)>,
+    )> {
         let mut threads: Vec<(
             u32,
             Vec<(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)>,
@@ -810,9 +868,8 @@ impl ReviewPanel {
             if comment.reply_to.is_none() {
                 if let Some(line) = comment.line {
                     let (cleaned_body, suggestions) = parse_suggestions(&comment.body);
-                    let md = cx.new(|cx| {
-                        Markdown::new(SharedString::from(cleaned_body), None, None, cx)
-                    });
+                    let md = cx
+                        .new(|cx| Markdown::new(SharedString::from(cleaned_body), None, None, cx));
                     threads.push((line, vec![(comment.clone(), md, suggestions)]));
                 }
             }
@@ -932,8 +989,7 @@ impl ReviewPanel {
                 let Some(active_repo) = self.active_repository.as_ref() else {
                     return;
                 };
-                let Some(project_path) =
-                    active_repo.read(cx).repo_path_to_project_path(&path, cx)
+                let Some(project_path) = active_repo.read(cx).repo_path_to_project_path(&path, cx)
                 else {
                     return;
                 };
@@ -959,8 +1015,7 @@ impl ReviewPanel {
                 let Some(active_repo) = self.active_repository.as_ref() else {
                     return;
                 };
-                let Some(project_path) =
-                    active_repo.read(cx).repo_path_to_project_path(&path, cx)
+                let Some(project_path) = active_repo.read(cx).repo_path_to_project_path(&path, cx)
                 else {
                     return;
                 };
