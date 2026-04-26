@@ -2,14 +2,15 @@ use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
 use crate::github_token::{GITHUB_CREDENTIALS_URL, GitHubTokenSource, resolve_github_token};
 use crate::inline_comment::{
-    ApplySuggestion, SuggestionBlock, parse_suggestions, render_pr_comment_block,
+    ApplySuggestion, SuggestionBlock, ToggleCommentThread, parse_suggestions,
+    render_pr_comment_block,
 };
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
 use crate::review_panel_settings::ReviewPanelSettings;
 use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewComment, ReviewProvider};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use anyhow::Result;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 use editor::{Anchor, Editor};
 use fs::Fs;
@@ -92,6 +93,7 @@ pub struct ReviewPanel {
     pr_ref_fetch_task: Option<gpui::Task<Result<()>>>,
     pending_action: Option<PendingAction>,
     injected_comment_blocks: HashMap<EntityId, (WeakEntity<Editor>, Vec<CustomBlockId>)>,
+    collapsed_comment_threads: HashSet<u64>,
     _workspace_subscription: Option<Subscription>,
 }
 
@@ -112,6 +114,27 @@ pub fn register(workspace: &mut Workspace) {
 
         panel.update(cx, |panel, cx| {
             panel.handle_apply_suggestion(comment_id, active_editor, cx);
+        });
+    });
+
+    workspace.register_action(|workspace, action: &ToggleCommentThread, _window, cx| {
+        let comment_id = action.comment_id;
+        let active_editor = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx));
+        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+            return;
+        };
+
+        panel.update(cx, |panel, cx| {
+            if !panel.collapsed_comment_threads.insert(comment_id) {
+                panel.collapsed_comment_threads.remove(&comment_id);
+            }
+
+            panel.remove_all_injected_blocks(cx);
+            if let Some(active_editor) = active_editor {
+                panel.inject_comments_for_editor(active_editor, cx);
+            }
         });
     });
 }
@@ -198,6 +221,7 @@ impl ReviewPanel {
             pr_ref_fetch_task: None,
             pending_action: None,
             injected_comment_blocks: HashMap::default(),
+            collapsed_comment_threads: HashSet::default(),
             _workspace_subscription: workspace_subscription,
         };
         this.initialize_provider(cx);
@@ -880,9 +904,9 @@ impl ReviewPanel {
         if self.selected_pr.is_none() {
             return;
         }
-        let Some((review_view, _)) = &self.review_view else {
+        if self.review_view.is_none() {
             return;
-        };
+        }
 
         let active_item = workspace.read(cx).active_item(cx);
         let Some(item) = active_item else {
@@ -892,10 +916,18 @@ impl ReviewPanel {
             return;
         };
 
+        self.inject_comments_for_editor(editor, cx);
+    }
+
+    fn inject_comments_for_editor(&mut self, editor: Entity<Editor>, cx: &mut Context<Self>) {
         let editor_id = editor.entity_id();
         if self.injected_comment_blocks.contains_key(&editor_id) {
             return;
         }
+
+        let Some((review_view, _)) = &self.review_view else {
+            return;
+        };
 
         if let Some(project_path) = editor.read(cx).project_path(cx) {
             let file_path = SharedString::from(
@@ -958,12 +990,19 @@ impl ReviewPanel {
                 };
 
                 let height = Self::estimate_block_height(&thread_comments);
+                let thread_id = thread_comments.first().map(|(comment, _, _)| comment.id);
+                let collapsed = thread_id
+                    .map(|thread_id| self.collapsed_comment_threads.contains(&thread_id))
+                    .unwrap_or(false);
+                let height = if collapsed { 2 } else { height };
                 let thread_clone = thread_comments.clone();
                 blocks.push(BlockProperties {
                     placement: BlockPlacement::Below(anchor),
                     height: Some(height),
                     style: BlockStyle::Flex,
-                    render: Arc::new(move |cx| render_pr_comment_block(thread_clone.clone(), cx)),
+                    render: Arc::new(move |cx| {
+                        render_pr_comment_block(thread_clone.clone(), collapsed, cx)
+                    }),
                     priority: 0,
                 });
             }
@@ -1004,13 +1043,18 @@ impl ReviewPanel {
                     }
                     let anchor = snapshot.anchor_before(Point::new(row, 0));
                     let height = Self::estimate_block_height(&thread_comments);
+                    let thread_id = thread_comments.first().map(|(comment, _, _)| comment.id);
+                    let collapsed = thread_id
+                        .map(|thread_id| self.collapsed_comment_threads.contains(&thread_id))
+                        .unwrap_or(false);
+                    let height = if collapsed { 2 } else { height };
                     let thread_clone = thread_comments.clone();
                     Some(BlockProperties {
                         placement: BlockPlacement::Below(anchor),
                         height: Some(height),
                         style: BlockStyle::Flex,
                         render: Arc::new(move |cx| {
-                            render_pr_comment_block(thread_clone.clone(), cx)
+                            render_pr_comment_block(thread_clone.clone(), collapsed, cx)
                         }),
                         priority: 0,
                     })
